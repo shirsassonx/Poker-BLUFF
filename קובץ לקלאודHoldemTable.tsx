@@ -1,0 +1,1065 @@
+import { useState, useEffect, useCallback, useRef } from “react”;
+import { useLocation } from “wouter”;
+import { usePokerSounds } from “../hooks/usePokerSounds”;
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+type Suit  = “♠” | “♥” | “♦” | “♣”;
+type Rank  = “2”|“3”|“4”|“5”|“6”|“7”|“8”|“9”|“10”|“J”|“Q”|“K”|“A”;
+interface Card { suit: Suit; rank: Rank; value: number }
+type Phase = “idle”|“preflop”|“flop”|“turn”|“river”|“showdown”;
+type BotAction = “fold”|“check”|“call”|“raise”;
+interface PendingRaise { toCall: number; pot: number; botChips: number; ptr: number; d: Card[]; fromPhase: Phase }
+
+// ── Deck ──────────────────────────────────────────────────────────────────────
+const SUITS: Suit[] = [“♠”,“♥”,“♦”,“♣”];
+const RANKS: { rank: Rank; value: number }[] = [
+{rank:“2”,value:2},{rank:“3”,value:3},{rank:“4”,value:4},{rank:“5”,value:5},
+{rank:“6”,value:6},{rank:“7”,value:7},{rank:“8”,value:8},{rank:“9”,value:9},
+{rank:“10”,value:10},{rank:“J”,value:11},{rank:“Q”,value:12},{rank:“K”,value:13},{rank:“A”,value:14},
+];
+const RED: Suit[] = [“♥”,“♦”];
+const INITIAL_CHIPS = 2000;
+const BIG_BLIND = 20;
+const SMALL_BLIND = 10;
+
+function buildDeck(): Card[] {
+return SUITS.flatMap(suit => RANKS.map(({ rank, value }) => ({ suit, rank, value })));
+}
+function shuffle(d: Card[]): Card[] {
+const a = […d];
+for (let i = a.length - 1; i > 0; i–) {
+const j = Math.floor(Math.random() * (i + 1));
+[a[i], a[j]] = [a[j], a[i]];
+}
+return a;
+}
+
+// ── Hand evaluator ────────────────────────────────────────────────────────────
+function combos5(arr: Card[]): Card[][] {
+if (arr.length < 5) return [];
+if (arr.length === 5) return [arr];
+const out: Card[][] = [];
+for (let i = 0; i < arr.length - 4; i++)
+for (let j = i+1; j < arr.length - 3; j++)
+for (let k = j+1; k < arr.length - 2; k++)
+for (let l = k+1; l < arr.length - 1; l++)
+for (let m = l+1; m < arr.length; m++)
+out.push([arr[i],arr[j],arr[k],arr[l],arr[m]]);
+return out;
+}
+interface HandResult { rank: number; name: string; tb: number[] }
+function evalHand(c: Card[]): HandResult {
+const vals = c.map(x => x.value).sort((a,b) => b-a);
+const suits = c.map(x => x.suit);
+const vc: Record<number,number> = {};
+vals.forEach(v => vc[v] = (vc[v]??0)+1);
+const cnts = Object.values(vc).sort((a,b) => b-a);
+const uv   = […new Set(vals)].sort((a,b) => b-a);
+const flush = suits.every(s => s === suits[0]);
+const str   = uv.length === 5 && uv[0]-uv[4] === 4;
+const wheel = JSON.stringify(uv) === JSON.stringify([14,5,4,3,2]);
+if (flush && (str||wheel)) return {rank:8, name:“STRAIGHT FLUSH”, tb: wheel?[5,4,3,2,1]:vals};
+if (cnts[0]===4)           return {rank:7, name:“FOUR OF A KIND”,  tb:vals};
+if (cnts[0]===3&&cnts[1]===2) return {rank:6, name:“FULL HOUSE”,  tb:vals};
+if (flush)                 return {rank:5, name:“FLUSH”,           tb:vals};
+if (str||wheel)            return {rank:4, name:“STRAIGHT”,        tb: wheel?[5,4,3,2,1]:vals};
+if (cnts[0]===3)           return {rank:3, name:“THREE OF A KIND”, tb:vals};
+if (cnts[0]===2&&cnts[1]===2) return {rank:2, name:“TWO PAIR”,    tb:vals};
+if (cnts[0]===2)           return {rank:1, name:“PAIR”,            tb:vals};
+return                          {rank:0, name:“HIGH CARD”,         tb:vals};
+}
+function best7(cards: Card[]): HandResult {
+const cs = combos5(cards);
+if (!cs.length) return evalHand(cards.slice(0,5));
+let best = evalHand(cs[0]);
+for (const c of cs.slice(1)) {
+const h = evalHand(c);
+if (h.rank > best.rank) { best=h; continue; }
+if (h.rank === best.rank) {
+for (let i=0;i<h.tb.length;i++) {
+if (h.tb[i] > best.tb[i]) { best=h; break; }
+if (h.tb[i] < best.tb[i]) break;
+}
+}
+}
+return best;
+}
+function compareHands(p: Card[], b: Card[], com: Card[]): “player”|“bot”|“tie” {
+const ph = best7([…p,…com]), bh = best7([…b,…com]);
+if (ph.rank > bh.rank) return “player”;
+if (bh.rank > ph.rank) return “bot”;
+for (let i=0;i<ph.tb.length;i++) {
+if (ph.tb[i] > bh.tb[i]) return “player”;
+if (bh.tb[i] > ph.tb[i]) return “bot”;
+}
+return “tie”;
+}
+
+// ── Bot AI ────────────────────────────────────────────────────────────────────
+function botDecide(pot:number, toCall:number, chips:number): {action:BotAction; amount:number} {
+const r = Math.random();
+if (r < 0.12 && toCall > 0)  return {action:“fold”,  amount:0};
+if (r < 0.35 && toCall === 0) return {action:“check”, amount:0};
+if (r < 0.70)                 return {action:“call”,  amount:Math.min(Math.max(toCall, BIG_BLIND), chips)};
+const minRaise = Math.max(toCall * 2, BIG_BLIND * 2);
+const raise = Math.min(Math.max(minRaise, Math.floor(pot * 0.5)), chips);
+if (raise <= 0 || chips <= toCall) return {action:“call”, amount:Math.min(toCall, chips)};
+return {action:“raise”, amount:raise};
+}
+
+// ── Galaxy CSS ────────────────────────────────────────────────────────────────
+const CARD_CSS = `@keyframes dealIn { 0%   { transform:translateY(-40px) scale(0.7) rotate(-8deg); opacity:0; } 70%  { transform:translateY(4px) scale(1.04) rotate(1deg);   opacity:1; } 100% { transform:translateY(0)   scale(1)    rotate(0deg);   opacity:1; } } @keyframes cardFlip { 0%   { transform: perspective(400px) rotateY(90deg) scale(0.85); opacity:0; } 55%  { transform: perspective(400px) rotateY(-6deg) scale(1.04); opacity:1; } 100% { transform: perspective(400px) rotateY(0deg)  scale(1);    opacity:1; } } @keyframes overlayIn { 0%   { opacity:0; transform:translate(-50%,-50%) scale(0.8); } 60%  { transform:translate(-50%,-50%) scale(1.05); } 100% { opacity:1; transform:translate(-50%,-50%) scale(1); } } @keyframes confettiFall { 0%   { transform:translateY(-20px) rotate(0deg);   opacity:1; } 100% { transform:translateY(110vh) rotate(720deg); opacity:0; } } @keyframes chipBounce { 0%,100% { transform:scale(1); } 50%      { transform:scale(1.18); } } @keyframes chipPop { 0%   { transform:scale(1) translateY(0); } 40%  { transform:scale(1.25) translateY(-6px); } 70%  { transform:scale(0.95) translateY(2px); } 100% { transform:scale(1) translateY(0); } } @keyframes chipFlyUp { 0%   { transform:translate(-50%,0)      scale(1);    opacity:1; } 75%  { transform:translate(-50%,-160px) scale(0.7);  opacity:1; } 100% { transform:translate(-50%,-190px) scale(0.4);  opacity:0; } } @keyframes chipFlyDown { 0%   { transform:translate(-50%,0)      scale(1);    opacity:1; } 75%  { transform:translate(-50%,160px)  scale(0.7);  opacity:1; } 100% { transform:translate(-50%,190px)  scale(0.4);  opacity:0; } } @keyframes starsTwinkle { 0%,100% { opacity:0.3; } 50%      { opacity:1; } } @keyframes allInPulse { 0%,100% { box-shadow:0 0 8px #cc44ff, 0 0 16px #cc44ff44; } 50%      { box-shadow:0 0 20px #cc44ff, 0 0 40px #cc44ff88; } } @keyframes raiseSlideIn { 0%   { transform:translateX(110%); opacity:0; } 100% { transform:translateX(0);    opacity:1; } } .card-deal    { animation: dealIn      0.35s cubic-bezier(.25,.46,.45,.94) both; } .card-flip    { animation: cardFlip    0.42s cubic-bezier(.25,.46,.45,.94) both; } .overlay-in   { animation: overlayIn   0.4s  cubic-bezier(.25,.46,.45,.94) both; } .chip-pop     { animation: chipPop     0.35s cubic-bezier(.25,.46,.45,.94) both; } .chip-fly-up  { animation: chipFlyUp   0.42s cubic-bezier(.4,0,.2,1) forwards; } .chip-fly-down{ animation: chipFlyDown 0.42s cubic-bezier(.4,0,.2,1) forwards; } .all-in-badge { animation: allInPulse  1.2s  ease-in-out infinite; } .raise-panel  { animation: raiseSlideIn 0.22s cubic-bezier(.25,.46,.45,.94) both; } @keyframes winGlow { 0%,100% { box-shadow: 0 0 0 2px rgba(245,195,24,0.6); } 50%      { box-shadow: 0 0 14px 2px rgba(245,195,24,0.9); } } .win-card     { animation: winGlow 1.4s ease-in-out infinite; } .win-card-dim { opacity: 0.42 !important; filter: brightness(0.7) !important; transition: opacity 0.3s, filter 0.3s; }`;
+
+// ── Galaxy Card components ────────────────────────────────────────────────────
+function CardFace({ card, size=“md”, delay=0, flip=false, highlight=false, dimmed=false }: { card:Card; size?:“sm”|“md”|“lg”; delay?:number; flip?:boolean; highlight?:boolean; dimmed?:boolean }) {
+const dim = size===“lg” ? {w:72,h:100,fRank:16,fSuit:36,fCorner:13}
+: size===“sm” ? {w:52,h:72, fRank:11,fSuit:22,fCorner:9}
+:               {w:62,h:88, fRank:14,fSuit:30,fCorner:11};
+const red = RED.includes(card.suit);
+const col = red ? “#cc0033” : “#1a0050”;
+return (
+<div
+dir=“ltr”
+className={`${flip ? "card-flip" : "card-deal"}${highlight ? " win-card" : ""}${dimmed ? " win-card-dim" : ""}`}
+style={{
+width:dim.w, height:dim.h, flexShrink:0,
+background: highlight
+? “#fffef5”
+: red
+? “linear-gradient(160deg,#fff5f8 60%,#ffe0ea)”
+: “linear-gradient(160deg,#f8f5ff 60%,#eae0ff)”,
+border: highlight
+? “2px solid rgba(245,195,24,0.9)”
+: `2px solid ${red?"#ff226688":"#9966ff88"}`,
+borderRadius:8,
+boxShadow: highlight ? “none” : `0 3px 16px #000c, 0 0 8px ${red?"#ff226633":"#9966ff33"}`,
+opacity: dimmed ? 0.45 : 1,
+filter: dimmed ? “brightness(0.72)” : undefined,
+position:“relative”,
+animationDelay:`${delay}s`,
+overflow:“hidden”,
+transition:“opacity 0.3s, filter 0.3s, border 0.3s”,
+}}
+>
+<div style={{position:“absolute”,top:3,left:4,lineHeight:1}}>
+<div style={{fontSize:dim.fCorner,fontWeight:“bold”,fontFamily:“monospace”,color:col}}>{card.rank}</div>
+<div style={{fontSize:dim.fCorner-1,color:col,marginTop:-1}}>{card.suit}</div>
+</div>
+<div style={{
+position:“absolute”,inset:0,display:“flex”,alignItems:“center”,justifyContent:“center”,
+fontSize:dim.fSuit,color:col,
+textShadow: red ? “0 0 8px #ff000033” : “0 0 8px #6600ff22”,
+}}>
+{card.suit}
+</div>
+<div style={{position:“absolute”,bottom:3,right:4,lineHeight:1,transform:“rotate(180deg)”,textAlign:“left”}}>
+<div style={{fontSize:dim.fCorner,fontWeight:“bold”,fontFamily:“monospace”,color:col}}>{card.rank}</div>
+<div style={{fontSize:dim.fCorner-1,color:col,marginTop:-1}}>{card.suit}</div>
+</div>
+<div style={{
+position:“absolute”,top:0,left:0,right:0,height:“40%”,
+background:“linear-gradient(180deg,rgba(255,255,255,0.35),transparent)”,
+pointerEvents:“none”,
+}}/>
+</div>
+);
+}
+
+function CardBack({ size=“md” }: { size?:“sm”|“md”|“lg” }) {
+const dim = size===“lg” ? {w:72,h:100} : size===“sm” ? {w:52,h:72} : {w:62,h:88};
+return (
+<div className=“card-deal” style={{
+width:dim.w, height:dim.h, flexShrink:0,
+background:“linear-gradient(135deg,#1a0050,#3d0099 50%,#1a0050)”,
+border:“2px solid #cc44ff88”,
+borderRadius:8,
+boxShadow:“0 3px 16px #000c, 0 0 12px #cc44ff44”,
+position:“relative”,
+overflow:“hidden”,
+}}>
+<div style={{
+position:“absolute”,inset:0,
+background:“repeating-linear-gradient(45deg,transparent,transparent 6px,rgba(204,68,255,0.08) 6px,rgba(204,68,255,0.08) 7px)”,
+}}/>
+<div style={{
+position:“absolute”,inset:6,
+border:“1px solid #cc44ff44”,
+borderRadius:4,
+background:“radial-gradient(ellipse,#cc44ff11,transparent)”,
+}}/>
+<div style={{
+position:“absolute”,inset:0,
+display:“flex”,alignItems:“center”,justifyContent:“center”,
+fontSize:22,opacity:0.6,
+}}>✦</div>
+</div>
+);
+}
+
+function EmptySlot({ size=“md” }: { size?:“sm”|“md”|“lg” }) {
+const dim = size===“lg” ? {w:72,h:100} : size===“sm” ? {w:52,h:72} : {w:62,h:88};
+return (
+<div style={{
+width:dim.w, height:dim.h,
+border:“2px dashed #9966ff33”,
+borderRadius:8,
+background:”#cc44ff08”,
+}}/>
+);
+}
+
+// ── Confetti ──────────────────────────────────────────────────────────────────
+const CONFETTI_COLORS = [”#cc44ff”,”#ff44cc”,”#00f7ff”,”#8866ff”,”#ff66aa”,”#44ffcc”,”#ffffff”,”#aa88ff”];
+function Confetti() {
+const pieces = Array.from({length:30}, (_,i) => ({
+id:i,
+left: Math.random()*100,
+delay: Math.random()*1.5,
+dur:   2 + Math.random()*2,
+size:  6 + Math.random()*8,
+color: CONFETTI_COLORS[Math.floor(Math.random()*CONFETTI_COLORS.length)],
+shape: Math.random() > 0.5 ? “50%” : “0”,
+}));
+return (
+<div style={{position:“fixed”,inset:0,pointerEvents:“none”,zIndex:200,overflow:“hidden”}}>
+{pieces.map(p => (
+<div key={p.id} style={{
+position:“absolute”, left:`${p.left}%`, top:-20,
+width:p.size, height:p.size,
+background:p.color, borderRadius:p.shape,
+animation:`confettiFall ${p.dur}s ${p.delay}s ease-in forwards`,
+}}/>
+))}
+</div>
+);
+}
+
+// ── Galaxy Result Overlay ─────────────────────────────────────────────────────
+interface OverlayProps {
+winner: “player”|“bot”|“tie”;
+message: string;
+potWon: number;
+onClose: () => void;
+}
+function ResultOverlay({ winner, message, potWon, onClose }: OverlayProps) {
+const isWin = winner === “player”;
+const isTie = winner === “tie”;
+const emoji = isWin ? “🏆” : isTie ? “🤝” : “💀”;
+const title = isWin ? “YOU WIN!” : isTie ? “IT’S A TIE” : “BOT WINS”;
+const color = isWin ? “#cc44ff” : isTie ? “#00f7ff” : “#ff4466”;
+const glow  = isWin ? “#cc44ff88” : isTie ? “#00f7ff66” : “#ff446666”;
+const bg    = isWin
+? “linear-gradient(135deg,#1a0040,#2d0066)”
+: isTie
+? “linear-gradient(135deg,#001040,#002060)”
+: “linear-gradient(135deg,#1a0010,#3d0020)”;
+return (
+<>
+{isWin && <Confetti />}
+<div
+onClick={onClose}
+style={{position:“fixed”,inset:0,zIndex:9998,background:“rgba(0,0,0,0.8)”,backdropFilter:“blur(6px)”}}
+/>
+<div
+className=“overlay-in”
+style={{
+position:“fixed”, top:“50%”, left:“50%”,
+zIndex:9999,
+width:“min(90vw, 360px)”,
+maxHeight:“90vh”, overflowY:“auto”,
+background:bg,
+border:`3px solid ${color}`,
+borderRadius:12,
+boxShadow:`0 0 60px ${glow}, 0 0 20px ${glow}, inset 0 0 30px ${color}11`,
+padding:“32px 24px”,
+textAlign:“center”,
+}}
+>
+<div style={{fontSize:64,lineHeight:1,marginBottom:12,filter:`drop-shadow(0 0 20px ${color})`}}>
+{emoji}
+</div>
+<div style={{fontSize:22,fontWeight:“bold”,letterSpacing:4,color,textShadow:`0 0 20px ${color}`,marginBottom:8}}>
+{title}
+</div>
+{isWin && potWon > 0 && (
+<div style={{
+fontSize:14,fontWeight:“bold”,letterSpacing:2,
+color:”#cc44ff”,marginBottom:6,
+animation:“chipBounce 0.6s ease infinite”,display:“inline-block”,
+}}>
++{potWon} CHIPS ✦
+</div>
+)}
+<div style={{fontSize:9,letterSpacing:1,color:”#cc99ff”,margin:“12px 0 20px”,lineHeight:1.6}}>
+{message}
+</div>
+<button
+onClick={onClose}
+style={{
+width:“100%”, padding:“14px 0”,
+fontSize:11, fontWeight:“bold”, letterSpacing:3,
+color, background:`${color}22`,
+border:`2px solid ${color}`,
+borderRadius:6,
+boxShadow:`0 0 20px ${glow}`,
+cursor:“pointer”,
+}}
+>
+CONTINUE ▶
+</button>
+</div>
+</>
+);
+}
+
+// ── Raise Panel (Galaxy style) ────────────────────────────────────────────────
+interface RaisePanelProps {
+playerChips: number;
+pot: number;
+betInput: number;
+setBetInput: (v: number) => void;
+onConfirm: () => void;
+onClose: () => void;
+}
+function RaisePanel({ playerChips, pot, betInput, setBetInput, onConfirm, onClose }: RaisePanelProps) {
+const isAllIn = betInput >= playerChips;
+const pct50 = Math.max(BIG_BLIND, Math.min(Math.floor(pot * 0.5), playerChips));
+const pct75 = Math.max(BIG_BLIND, Math.min(Math.floor(pot * 0.75), playerChips));
+const btnBase: React.CSSProperties = {
+padding:“6px 0”, fontSize:9, fontWeight:“bold”, letterSpacing:1,
+background:”#cc44ff11”, border:“1px solid #cc44ff33”,
+color:”#cc99ff”, cursor:“pointer”, borderRadius:4,
+};
+return (
+<div className=“raise-panel” style={{
+position:“absolute”, right:0, top:0, bottom:0, width:160,
+background:“linear-gradient(180deg,#1a0040ee,#0d0020ee)”,
+borderLeft:“2px solid #cc44ff44”,
+padding:“12px 10px”,
+display:“flex”, flexDirection:“column”, gap:6,
+zIndex:50,
+}}>
+<button
+onClick={() => setBetInput(playerChips)}
+className={isAllIn ? “all-in-badge” : “”}
+style={{
+…btnBase,
+color:”#cc44ff”, border:“1px solid #cc44ff66”,
+background: isAllIn ? “#cc44ff22” : “#cc44ff11”,
+padding:“8px 0”, fontSize:10, letterSpacing:2,
+}}
+>
+ALL-IN ✦
+</button>
+<div style={{textAlign:“center”,fontSize:18,fontWeight:“bold”,color:”#cc44ff”,textShadow:“0 0 12px #cc44ff”,padding:“2px 0”}}>
+{betInput}
+</div>
+<button onClick={() => setBetInput(pct75)} style={btnBase}>¾ POT</button>
+<button onClick={() => setBetInput(pct50)} style={btnBase}>½ POT</button>
+<div style={{display:“flex”,gap:4}}>
+<button onClick={() => setBetInput(Math.max(BIG_BLIND, betInput - 10))}
+style={{…btnBase,flex:1,fontSize:14,color:”#cc44ff”}}>−</button>
+<button onClick={() => setBetInput(Math.min(playerChips, betInput + 10))}
+style={{…btnBase,flex:1,fontSize:14,color:”#cc44ff”}}>+</button>
+</div>
+<input type=“range” dir=“ltr”
+min={BIG_BLIND} max={playerChips} step={10} value={betInput}
+onChange={e => setBetInput(Number(e.target.value))}
+style={{accentColor:”#cc44ff”,cursor:“pointer”}}
+/>
+<button onClick={onConfirm} style={{
+padding:“10px 0”, fontSize:10, fontWeight:“bold”, letterSpacing:2,
+color:”#cc44ff”, background:”#cc44ff22”,
+border:“2px solid #cc44ff66”, borderRadius:6,
+boxShadow:“0 0 14px #cc44ff44”, cursor:“pointer”,
+}}>
+RAISE ↑
+</button>
+<button onClick={onClose} style={{
+padding:“4px 0”, fontSize:8, color:”#ffffff44”,
+background:“transparent”, border:“none”, cursor:“pointer”,
+}}>
+CANCEL
+</button>
+</div>
+);
+}
+
+// ── Main component ────────────────────────────────────────────────────────────
+export default function HoldemTable() {
+const [, navigate] = useLocation();
+
+const cssRef = useRef(false);
+if (!cssRef.current) {
+cssRef.current = true;
+const el = document.createElement(“style”);
+el.textContent = CARD_CSS;
+document.head.appendChild(el);
+}
+
+const sounds = usePokerSounds();
+const { muted, toggleMute, volume, setVolume } = sounds;
+
+const haptic = (style: “light”|“medium”|“heavy”|“rigid”|“soft” = “light”) => {
+try { window.Telegram?.WebApp?.hapticFeedback?.impactOccurred(style); } catch {}
+};
+const hapticNotify = (type: “success”|“error”|“warning”) => {
+try { window.Telegram?.WebApp?.hapticFeedback?.notificationOccurred(type); } catch {}
+};
+
+const [deck,        setDeck]        = useState<Card[]>([]);
+const [playerHand,  setPlayerHand]  = useState<Card[]>([]);
+const [botHand,     setBotHand]     = useState<Card[]>([]);
+const [community,   setCommunity]   = useState<Card[]>([]);
+const [phase,       setPhase]       = useState<Phase>(“idle”);
+const [deckPtr,     setDeckPtr]     = useState(0);
+
+const [playerChips, setPlayerChips] = useState(INITIAL_CHIPS);
+const [botChips,    setBotChips]    = useState(INITIAL_CHIPS);
+const [pot,         setPot]         = useState(0);
+const [currentBet,  setCurrentBet]  = useState(0);
+const [betInput,    setBetInput]    = useState(BIG_BLIND * 2);
+
+const [handName,    setHandName]    = useState(””);
+const [message,     setMessage]     = useState(“Press DEAL to start”);
+const [botFolded,   setBotFolded]   = useState(false);
+const [botActionLabel, setBotActionLabel] = useState(””);
+const [showdown,    setShowdown]    = useState(false);
+const [winner,      setWinner]      = useState<“player”|“bot”|“tie”|””>(””);
+const [overlay,     setOverlay]     = useState(false);
+const [overlayMsg,  setOverlayMsg]  = useState(””);
+const [potWon,      setPotWon]      = useState(0);
+const [pendingBotRaise, setPendingBotRaise] = useState<PendingRaise | null>(null);
+const [raiseOpen,   setRaiseOpen]   = useState(false);
+
+const [flyingChips, setFlyingChips] = useState<{ id: number; from: “player”|“bot” }[]>([]);
+const chipIdRef = useRef(0);
+const spawnChip = useCallback((from: “player”|“bot”) => {
+const id = ++chipIdRef.current;
+setFlyingChips(prev => […prev, { id, from }]);
+}, []);
+
+const [playerWinKeys, setPlayerWinKeys] = useState<Set<string>>(new Set());
+const [botWinKeys,    setBotWinKeys]    = useState<Set<string>>(new Set());
+
+const [tgId, setTgId] = useState<number | null>(null);
+
+// Stable star positions (no re-render)
+const stars = useRef(Array.from({length:40}, (_, i) => ({
+id: i,
+left: Math.random() * 100,
+top:  Math.random() * 100,
+size: Math.random() > 0.85 ? 3 : Math.random() > 0.6 ? 2 : 1,
+dur:  1.5 + Math.random() * 3,
+delay: Math.random() * 3,
+})));
+
+useEffect(() => {
+const uid = window.Telegram?.WebApp?.initDataUnsafe?.user?.id ?? null;
+if (!uid) return;
+setTgId(uid);
+fetch(`/api/player/profile?telegramId=${uid}`)
+.then(r => r.ok ? r.json() : null)
+.then(data => {
+if (data && typeof data.chips === “number”) {
+setPlayerChips(data.chips > 0 ? data.chips : INITIAL_CHIPS);
+}
+})
+.catch(() => {});
+// eslint-disable-next-line react-hooks/exhaustive-deps
+}, []);
+
+useEffect(() => {
+if (playerHand.length < 2) return;
+const all = […playerHand, …community];
+setHandName(all.length >= 5 ? best7(all).name : evalHand(playerHand).name);
+}, [playerHand, community]);
+
+useEffect(() => {
+if (community.length > 0) sounds.playDeal();
+// eslint-disable-next-line react-hooks/exhaustive-deps
+}, [community.length]);
+
+useEffect(() => {
+if (!overlay || !winner) return;
+if (winner === “player”) { sounds.playWin(); hapticNotify(“success”); }
+else if (winner === “bot”) { sounds.playLose(); hapticNotify(“error”); }
+else { hapticNotify(“warning”); }
+// eslint-disable-next-line react-hooks/exhaustive-deps
+}, [overlay]);
+
+const sendGameResult = useCallback((tid: number|null, result: “player”|“bot”|“tie”, handName: string, won: number) => {
+if (!tid) return;
+fetch(”/api/telegram/game-result”, {
+method:“POST”, headers:{“Content-Type”:“application/json”},
+body:JSON.stringify({ telegramId:tid, winner:result, handName, potWon:won }),
+}).catch(()=>{});
+}, []);
+
+const saveChips = useCallback((chips: number, tid: number|null) => {
+if (!tid) return;
+fetch(”/api/player/chips”, {
+method:“PUT”, headers:{“Content-Type”:“application/json”},
+body:JSON.stringify({ telegramId:tid, chips }),
+}).catch(()=>{});
+}, []);
+
+const advancePhase = useCallback((
+fromPhase: Phase, ptr: number, d: Card[],
+currentPot: number, currentBotChips: number,
+) => {
+setCurrentBet(0); setBetInput(BIG_BLIND * 2); setPendingBotRaise(null); setRaiseOpen(false);
+if (fromPhase === “preflop”) {
+setCommunity([d[ptr],d[ptr+1],d[ptr+2]]); setDeckPtr(ptr+3); setPhase(“flop”);
+setMessage(“FLOP — your action.”);
+} else if (fromPhase === “flop”) {
+setCommunity(prev => […prev, d[ptr]]); setDeckPtr(ptr+1); setPhase(“turn”);
+setMessage(“TURN — your action.”);
+} else if (fromPhase === “turn”) {
+setCommunity(prev => […prev, d[ptr]]); setDeckPtr(ptr+1); setPhase(“river”);
+setMessage(“RIVER — your action.”);
+} else if (fromPhase === “river”) {
+setPhase(“showdown”); setShowdown(true);
+setCommunity(prev => {
+const com = prev;
+setPlayerHand(ph => {
+setBotHand(bh => {
+const result = compareHands(ph, bh, com);
+const pB = best7([…ph,…com]), bB = best7([…bh,…com]);
+setWinner(result);
+// compute which cards make the best hand
+const cardKey = (c: Card) => `${c.rank}${c.suit}`;
+const bestCombo5 = (hand: Card[], community: Card[]) => {
+const all = […hand, …community];
+const cs = combos5(all);
+if (!cs.length) return hand;
+let best = cs[0], bestH = evalHand(cs[0]);
+for (const c of cs.slice(1)) {
+const h = evalHand(c);
+if (h.rank > bestH.rank) { best=c; bestH=h; }
+}
+return best;
+};
+const pWin5 = bestCombo5(ph, com);
+const bWin5 = bestCombo5(bh, com);
+setPlayerWinKeys(new Set(pWin5.map(cardKey)));
+setBotWinKeys(new Set(bWin5.map(cardKey)));
+let msg = “”, won = 0;
+if (result === “player”) {
+setPlayerChips(p => { const next = p + currentPot; setTimeout(() => saveChips(next, tgId), 300); return next; });
+setPot(0); msg = `${pB.name} beats ${bB.name}!`; won = currentPot;
+} else if (result === “bot”) {
+setBotChips(currentBotChips + currentPot); setPot(0);
+msg = `Bot wins with ${bB.name} vs your ${pB.name}`;
+setPlayerChips(p => { setTimeout(() => saveChips(p, tgId), 300); return p; });
+} else {
+const half = Math.floor(currentPot / 2);
+setPlayerChips(p => { const next = p + half; setTimeout(() => saveChips(next, tgId), 300); return next; });
+setBotChips(currentBotChips + half); setPot(0);
+msg = `Both have ${pB.name}`; won = half;
+}
+setPotWon(won); setOverlayMsg(msg);
+setTimeout(() => setOverlay(true), 1400);
+sendGameResult(tgId, result, result===“player”?pB.name:result===“bot”?bB.name:pB.name, won);
+return bh;
+});
+return ph;
+});
+return com;
+});
+}
+}, [tgId, saveChips, sendGameResult]);
+
+const getBotDelay = () => ({fast:300,normal:900,slow:1800}[localStorage.getItem(“botSpeed”)??“normal”] ?? 900);
+
+const runBotTurn = useCallback((
+currentPot: number, toCall: number, currentBotChips: number,
+ptr: number, _com: Card[], d: Card[], fromPhase: Phase,
+) => {
+setTimeout(() => {
+const { action, amount } = botDecide(currentPot, toCall, currentBotChips);
+setBotActionLabel(action.toUpperCase());
+
+```
+  if (action === "fold") {
+    setBotFolded(true); setPhase("showdown"); setShowdown(true); setWinner("player");
+    setPlayerChips(p => p + currentPot); setPot(0);
+    setPotWon(currentPot); setOverlayMsg("Bot folded — the pot is yours!");
+    setTimeout(() => setOverlay(true), 300);
+    sendGameResult(tgId, "player", "Bot folded", currentPot);
+    return;
+  }
+  if (action === "check") {
+    advancePhase(fromPhase, ptr, d, currentPot, currentBotChips); return;
+  }
+  if (action === "call") {
+    const paid = Math.min(amount, currentBotChips);
+    const newPot = currentPot + paid, newBotChips = currentBotChips - paid;
+    spawnChip("bot"); setPot(newPot); setBotChips(newBotChips);
+    advancePhase(fromPhase, ptr, d, newPot, newBotChips); return;
+  }
+  if (action === "raise") {
+    const paid = Math.min(amount, currentBotChips);
+    const newPot = currentPot + paid, newBotChips = currentBotChips - paid;
+    spawnChip("bot"); setPot(newPot); setBotChips(newBotChips);
+    setCurrentBet(paid); setMessage(`Bot raises ${paid} — call or fold?`);
+    setPendingBotRaise({ toCall:paid, pot:newPot, botChips:newBotChips, ptr, d, fromPhase }); return;
+  }
+}, getBotDelay());
+```
+
+}, [advancePhase, spawnChip, tgId, sendGameResult]);
+
+const dealNewHand = useCallback(() => {
+haptic(“medium”); sounds.playDeal();
+const d = shuffle(buildDeck());
+const ph: Card[] = [d[0], d[2]], bh: Card[] = [d[1], d[3]];
+setDeck(d); setDeckPtr(4);
+setPlayerHand(ph); setBotHand(bh);
+setCommunity([]); setPhase(“preflop”);
+setShowdown(false); setBotFolded(false);
+setBotActionLabel(””); setWinner(””); setOverlay(false);
+setPendingBotRaise(null); setRaiseOpen(false);
+setPlayerWinKeys(new Set()); setBotWinKeys(new Set());
+setPot(BIG_BLIND + SMALL_BLIND);
+setPlayerChips(p => p - SMALL_BLIND); setBotChips(p => p - BIG_BLIND);
+setCurrentBet(BIG_BLIND); setBetInput(BIG_BLIND * 2);
+setMessage(“Pre-flop — call, raise, or fold.”);
+// eslint-disable-next-line react-hooks/exhaustive-deps
+}, [sounds]);
+
+const isActing = phase !== “showdown” && phase !== “idle”;
+
+const handleFold = () => {
+if (!isActing) return;
+haptic(“heavy”); sounds.playFold(); hapticNotify(“error”);
+setPendingBotRaise(null); setRaiseOpen(false);
+setBotChips(botChips + pot); setPot(0);
+setPhase(“showdown”); setShowdown(true); setWinner(“bot”);
+setPotWon(0); setOverlayMsg(“You folded. Better luck next hand!”);
+setTimeout(() => setOverlay(true), 200);
+sendGameResult(tgId, “bot”, “You folded”, 0);
+};
+const handleCheck = () => {
+if (!isActing || pendingBotRaise) return;
+haptic(“light”); sounds.playCheck(); setMessage(“You check.”);
+runBotTurn(pot, 0, botChips, deckPtr, community, deck, phase);
+};
+const handleCall = () => {
+if (!isActing) return;
+haptic(“medium”); sounds.playChip(); spawnChip(“player”); setRaiseOpen(false);
+if (pendingBotRaise) {
+const { toCall, pot:rPot, botChips:rBotChips, ptr, d, fromPhase } = pendingBotRaise;
+const paid = Math.min(toCall, playerChips);
+setPlayerChips(p => p - paid);
+const newPot = rPot + paid; setPot(newPot);
+setMessage(`You call ${paid}.`);
+advancePhase(fromPhase, ptr, d, newPot, rBotChips); return;
+}
+const amount = Math.min(currentBet || BIG_BLIND, playerChips);
+setPlayerChips(p => p - amount);
+const newPot = pot + amount; setPot(newPot);
+setMessage(`You call ${amount}.`);
+runBotTurn(newPot, 0, botChips, deckPtr, community, deck, phase);
+};
+const handleRaise = () => {
+if (!isActing || betInput <= 0 || pendingBotRaise) return;
+haptic(“rigid”); sounds.playChip(); setRaiseOpen(false);
+const amount = Math.min(betInput, playerChips);
+if (amount <= 0) return;
+spawnChip(“player”); setPlayerChips(p => p - amount);
+const newPot = pot + amount; setPot(newPot); setCurrentBet(amount);
+setMessage(`You raise ${amount}.`);
+runBotTurn(newPot, amount, botChips, deckPtr, community, deck, phase);
+};
+
+const needsReload = playerChips < BIG_BLIND && phase === “showdown”;
+const reloadChips = () => {
+haptic(“medium”); sounds.playChip();
+setPlayerChips(INITIAL_CHIPS); setBotChips(INITIAL_CHIPS);
+setPot(0); setPhase(“idle”); setOverlay(false); setRaiseOpen(false);
+setPlayerHand([]); setBotHand([]); setCommunity([]);
+setMessage(“Chips reloaded — press DEAL.”);
+};
+
+const isAllIn = betInput >= playerChips;
+
+const renderCommunityCards = () => (
+<div style={{display:“flex”,gap:4,alignItems:“center”,justifyContent:“center”,flexWrap:“nowrap”}}>
+<div style={{display:“flex”,gap:4}}>
+{[0,1,2].map(i => {
+const c = community[i];
+if (!c) return <EmptySlot key={i} size="md"/>;
+const ck = `${c.rank}${c.suit}`;
+const isWin = showdown && playerWinKeys.size > 0 && playerWinKeys.has(ck);
+const isDim = showdown && playerWinKeys.size > 0 && !isWin;
+return <CardFace key={i} card={c} size="md" delay={i*0.08} highlight={isWin} dimmed={isDim}/>;
+})}
+</div>
+<div style={{width:6,flexShrink:0}}/>
+{[3,4].map(i => {
+const c = community[i];
+if (!c) return <EmptySlot key={i} size="md"/>;
+const ck = `${c.rank}${c.suit}`;
+const isWin = showdown && playerWinKeys.size > 0 && playerWinKeys.has(ck);
+const isDim = showdown && playerWinKeys.size > 0 && !isWin;
+return <CardFace key={i} card={c} size="md" delay={i*0.04} highlight={isWin} dimmed={isDim}/>;
+})}
+</div>
+);
+
+// ── Render ──────────────────────────────────────────────────────────────────
+return (
+<div dir=“ltr” style={{
+display:“flex”, flexDirection:“column”,
+position:“fixed”, inset:0, overflow:“hidden”,
+background:”#06001a”,
+maxWidth:480, margin:“0 auto”,
+left:“50%”, transform:“translateX(-50%)”, width:“100%”,
+}}>
+
+```
+  {/* ── Galaxy starfield background ─────────────────────────────────────── */}
+  <div style={{position:"absolute",inset:0,pointerEvents:"none",zIndex:0}}>
+    <div style={{
+      position:"absolute",inset:0,
+      background:"radial-gradient(ellipse 80% 50% at 50% 30%,#2d006688,transparent)",
+    }}/>
+    {stars.current.map(s => (
+      <div key={s.id} style={{
+        position:"absolute",
+        left:`${s.left}%`, top:`${s.top}%`,
+        width:s.size, height:s.size,
+        borderRadius:"50%",
+        background:"#fff",
+        animation:`starsTwinkle ${s.dur}s ${s.delay}s ease-in-out infinite`,
+      }}/>
+    ))}
+  </div>
+
+  {/* Overlays */}
+  {overlay && winner && (
+    <ResultOverlay
+      winner={winner as "player"|"bot"|"tie"}
+      message={overlayMsg}
+      potWon={potWon}
+      onClose={() => { haptic("light"); setOverlay(false); }}
+    />
+  )}
+
+  {/* ── Header ──────────────────────────────────────────────────────────── */}
+  <div style={{
+    position:"relative", zIndex:10,
+    display:"flex", alignItems:"center", gap:10,
+    padding:"10px 14px",
+    background:"linear-gradient(180deg,#0d0020,#06001a)",
+    borderBottom:"2px solid #3d0066",
+    flexShrink:0,
+  }}>
+    <button
+      onClick={() => { haptic("light"); navigate("/"); }}
+      style={{fontSize:9,fontWeight:"bold",padding:"6px 12px",border:"2px solid #ff4466",color:"#ff4466",background:"#1a0010",cursor:"pointer",flexShrink:0,letterSpacing:1,borderRadius:4}}
+    >
+      ✕ EXIT
+    </button>
+    <div style={{flex:1,textAlign:"center",fontSize:13,fontWeight:"bold",letterSpacing:4,color:"#cc44ff",textShadow:"0 0 16px #cc44ff"}}>
+      HOLD'EM
+    </div>
+    <div style={{fontSize:10,fontWeight:"bold",padding:"5px 10px",border:"1px solid #cc44ff44",color:"#cc44ff",background:"#cc44ff11",flexShrink:0,borderRadius:4}}>
+      POT: {pot}
+    </div>
+    <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+      <button
+        onClick={() => { haptic("light"); toggleMute(); }}
+        title={muted ? "Unmute" : "Mute"}
+        aria-label={muted ? "Unmute sounds" : "Mute sounds"}
+        aria-pressed={muted}
+        style={{
+          fontSize:16,padding:"4px 8px",
+          border:`2px solid ${muted?"#555":"#cc44ff"}`,
+          color: muted?"#555":"#cc44ff",
+          background: muted?"#111":"#cc44ff18",
+          cursor:"pointer",flexShrink:0,lineHeight:1,borderRadius:4,
+          boxShadow: muted?undefined:"0 0 8px #cc44ff44",
+        }}
+      >
+        {muted ? "🔇" : "🔊"}
+      </button>
+      <input
+        type="range" min={0} max={100} value={volume} disabled={muted}
+        onChange={e => setVolume(Number(e.target.value))}
+        style={{width:56,accentColor:"#cc44ff",opacity:muted?0.3:1,cursor:muted?"not-allowed":"pointer"}}
+      />
+    </div>
+  </div>
+
+  {/* ── Phase bar ───────────────────────────────────────────────────────── */}
+  <div style={{
+    position:"relative",zIndex:10,
+    display:"flex",justifyContent:"center",gap:6,padding:"7px",
+    background:"#04000f",borderBottom:"1px solid #2d0050",flexShrink:0,
+  }}>
+    {(["preflop","flop","turn","river"] as Phase[]).map(p => {
+      const phaseOrder = ["preflop","flop","turn","river","showdown"];
+      const cur = phaseOrder.indexOf(phase), tgt = phaseOrder.indexOf(p);
+      const active = phase === p, passed = cur > tgt && cur >= 0;
+      return (
+        <div key={p} style={{
+          fontSize:7,padding:"3px 8px",fontWeight:"bold",letterSpacing:2,
+          color: active?"#cc44ff":passed?"#44ffcc":"#330055",
+          border:`1px solid ${active?"#cc44ff":passed?"#44ffcc33":"#1a0033"}`,
+          background: active?"#cc44ff18":"transparent",
+          textShadow: active?"0 0 10px #cc44ff":undefined,
+          borderRadius:3,
+        }}>
+          {p.toUpperCase()}
+        </div>
+      );
+    })}
+  </div>
+
+  {/* ── Galaxy poker table ───────────────────────────────────────────────── */}
+  <div style={{
+    flex:1, display:"flex", flexDirection:"column", justifyContent:"space-evenly",
+    background:"radial-gradient(ellipse 120% 120% at 50% 50%,#2d0066 0%,#110033 45%,#06001a 100%)",
+    borderTop:"3px solid #4400aa",
+    borderBottom:"3px solid #4400aa",
+    boxShadow:"inset 0 0 80px #000c, inset 0 0 40px #cc44ff0a",
+    overflow:"hidden",
+    position:"relative",
+    padding:"8px 0",
+    zIndex:1,
+  }}>
+
+    {/* Oval galaxy table outline */}
+    <div style={{
+      position:"absolute",inset:"10%",
+      border:"2px solid #cc44ff18",
+      borderRadius:"50%",
+      pointerEvents:"none",
+      boxShadow:"0 0 30px #cc44ff0a",
+    }}/>
+
+    {/* ── BOT row ────────────────────────────────────────────────────────── */}
+    <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:6,padding:"8px 16px",flexShrink:0}}>
+      <div style={{display:"flex",alignItems:"center",gap:8}}>
+        <span style={{fontSize:7,letterSpacing:2,color:"#cc44ff66"}}>🤖 BOT</span>
+        <span style={{fontSize:13,fontWeight:"bold",color:"#cc44ff",textShadow:"0 0 10px #cc44ff66"}}>
+          {botChips.toLocaleString()}
+        </span>
+        {botActionLabel && (
+          <span style={{
+            fontSize:8,fontWeight:"bold",padding:"2px 8px",letterSpacing:1,
+            color: botActionLabel==="FOLD"?"#ff4466":botActionLabel==="RAISE"?"#cc44ff":"#00f7ff",
+            border:"1px solid currentColor",background:"#00000099",borderRadius:3,
+          }}>
+            {botActionLabel}
+          </span>
+        )}
+      </div>
+      <div style={{display:"flex",gap:10}}>
+        {phase==="idle"
+          ? <><EmptySlot size="lg"/><EmptySlot size="lg"/></>
+          : showdown && !botFolded
+          ? botHand.map((c,i) => {
+              const ck = `${c.rank}${c.suit}`;
+              const isWin = botWinKeys.size > 0 && botWinKeys.has(ck);
+              const isDim = botWinKeys.size > 0 && !isWin;
+              return <CardFace key={i} card={c} size="lg" delay={i*0.08} flip highlight={isWin} dimmed={isDim}/>;
+            })
+          : botFolded
+          ? <><EmptySlot size="lg"/><EmptySlot size="lg"/></>
+          : <><CardBack size="lg"/><CardBack size="lg"/></>
+        }
+      </div>
+    </div>
+
+    {/* ── Center: community cards + pot ──────────────────────────────────── */}
+    <div style={{flexShrink:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:8,padding:"4px 0"}}>
+      {renderCommunityCards()}
+
+      {pot > 0 && (
+        <div key={pot} className="chip-pop" style={{
+          display:"flex",alignItems:"center",gap:6,
+          background:"#00000066",border:"1px solid #cc44ff44",
+          padding:"4px 14px",borderRadius:20,
+        }}>
+          <span style={{fontSize:14}}>✦</span>
+          <span style={{fontSize:11,fontWeight:"bold",letterSpacing:2,color:"#cc44ff",textShadow:"0 0 10px #cc44ff"}}>
+            {pot.toLocaleString()}
+          </span>
+        </div>
+      )}
+
+      <div style={{
+        fontSize:8,color:"#ffffffbb",letterSpacing:1,
+        textAlign:"center",maxWidth:260,lineHeight:1.6,
+        background:"#00000044",padding:"4px 12px",borderRadius:6,
+      }}>
+        {pendingBotRaise
+          ? `🚀 BOT RAISES ${pendingBotRaise.toCall} — CALL OR FOLD?`
+          : message}
+      </div>
+    </div>
+
+    {/* ── Flying chip animations ─────────────────────────────────────────── */}
+    {flyingChips.map(chip => (
+      <div
+        key={chip.id}
+        className={chip.from==="player"?"chip-fly-up":"chip-fly-down"}
+        onAnimationEnd={() => setFlyingChips(prev => prev.filter(c => c.id !== chip.id))}
+        style={{
+          position:"absolute",left:"50%",
+          ...(chip.from==="player" ? {bottom:"22%"} : {top:"22%"}),
+          fontSize:20,pointerEvents:"none",zIndex:10,
+          willChange:"transform,opacity",
+          filter:"drop-shadow(0 0 6px #cc44ff99)",
+        }}
+      >
+        ✦
+      </div>
+    ))}
+
+    {/* ── PLAYER row ─────────────────────────────────────────────────────── */}
+    <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:4,padding:"6px 16px 8px",flexShrink:0}}>
+      <div style={{display:"flex",gap:10}}>
+        {phase==="idle"
+          ? <><EmptySlot size="lg"/><EmptySlot size="lg"/></>
+          : playerHand.map((c,i) => {
+              const ck = `${c.rank}${c.suit}`;
+              const isWin = showdown && playerWinKeys.size > 0 && playerWinKeys.has(ck);
+              const isDim = showdown && playerWinKeys.size > 0 && !isWin;
+              return <CardFace key={i} card={c} size="lg" delay={i*0.1} highlight={isWin} dimmed={isDim}/>;
+            })
+        }
+      </div>
+      <div style={{display:"flex",alignItems:"center",gap:8}}>
+        {handName && phase!=="idle" && (
+          <span style={{fontSize:8,fontWeight:"bold",padding:"2px 8px",color:"#cc44ff",border:"1px solid #cc44ff44",background:"#cc44ff11",letterSpacing:1,borderRadius:3}}>
+            {handName}
+          </span>
+        )}
+        {isAllIn && phase!=="idle" && phase!=="showdown" && (
+          <span className="all-in-badge" style={{fontSize:7,fontWeight:"bold",padding:"2px 8px",color:"#cc44ff",border:"1px solid #cc44ff",background:"#cc44ff22",letterSpacing:1,borderRadius:3}}>
+            ALL-IN
+          </span>
+        )}
+        <span style={{fontSize:7,letterSpacing:2,color:"#ffffff33"}}>YOU</span>
+        <span style={{fontSize:13,fontWeight:"bold",color:"#00f7ff",textShadow:"0 0 8px #00f7ff66"}}>
+          {playerChips.toLocaleString()}
+        </span>
+      </div>
+    </div>
+  </div>
+
+  {/* ── Controls ─────────────────────────────────────────────────────────── */}
+  <div dir="ltr" style={{
+    position:"relative",
+    padding:"10px 12px 14px",
+    background:"linear-gradient(180deg,#0d0020,#06001a)",
+    borderTop:"2px solid #3d0066",
+    flexShrink:0,
+    zIndex:10,
+  }}>
+    {/* Raise panel (slides in from right) */}
+    {raiseOpen && (
+      <RaisePanel
+        playerChips={playerChips}
+        pot={pot}
+        betInput={betInput}
+        setBetInput={setBetInput}
+        onConfirm={handleRaise}
+        onClose={() => setRaiseOpen(false)}
+      />
+    )}
+
+    {/* Action buttons */}
+    {phase==="idle" || phase==="showdown" ? (
+      <div style={{display:"flex",gap:8}}>
+        {needsReload && (
+          <button onClick={reloadChips} style={{
+            flex:1,padding:"13px 0",fontSize:10,fontWeight:"bold",letterSpacing:2,
+            color:"#00f7ff",background:"#00f7ff18",border:"2px solid #00f7ff66",
+            borderRadius:6,boxShadow:"0 0 12px #00f7ff33",cursor:"pointer",
+          }}>
+            💰 BUY CHIPS
+          </button>
+        )}
+        <button
+          onClick={dealNewHand}
+          disabled={playerChips < BIG_BLIND}
+          style={{
+            flex:1,padding:"13px 0",fontSize:10,fontWeight:"bold",letterSpacing:2,
+            color: playerChips<BIG_BLIND?"#444":"#cc44ff",
+            background: playerChips<BIG_BLIND?"#111":"#cc44ff18",
+            border:`2px solid ${playerChips<BIG_BLIND?"#333":"#cc44ff66"}`,
+            borderRadius:6,
+            boxShadow: playerChips<BIG_BLIND?undefined:"0 0 14px #cc44ff33",
+            cursor: playerChips<BIG_BLIND?"not-allowed":"pointer",
+          }}
+        >
+          🃏 DEAL NEW HAND
+        </button>
+      </div>
+    ) : pendingBotRaise ? (
+      <div style={{display:"flex",gap:8}}>
+        <button onClick={handleFold} style={{
+          flex:1,padding:"13px 0",fontSize:11,fontWeight:"bold",letterSpacing:2,
+          color:"#ff4466",background:"#ff446618",border:"2px solid #ff446666",
+          borderRadius:6,cursor:"pointer",
+        }}>
+          FOLD
+        </button>
+        <button onClick={handleCall} style={{
+          flex:2,padding:"13px 0",fontSize:11,fontWeight:"bold",letterSpacing:2,
+          color:"#00f7ff",background:"#00f7ff18",border:"2px solid #00f7ff66",
+          borderRadius:6,boxShadow:"0 0 12px #00f7ff33",cursor:"pointer",
+        }}>
+          CALL {Math.min(pendingBotRaise.toCall, playerChips)}
+        </button>
+      </div>
+    ) : (
+      <div style={{display:"flex",gap:6}}>
+        <button onClick={handleFold} disabled={!isActing} style={{
+          flex:1,padding:"13px 0",fontSize:10,fontWeight:"bold",letterSpacing:2,
+          color:isActing?"#ff4466":"#333",background:isActing?"#ff446618":"#111",
+          border:`2px solid ${isActing?"#ff446655":"#222"}`,borderRadius:6,
+          cursor:isActing?"pointer":"not-allowed",
+        }}>FOLD</button>
+        {currentBet === 0
+          ? <button onClick={handleCheck} disabled={!isActing} style={{
+              flex:1.4,padding:"13px 0",fontSize:10,fontWeight:"bold",letterSpacing:2,
+              color:isActing?"#00f7ff":"#333",background:isActing?"#00f7ff18":"#111",
+              border:`2px solid ${isActing?"#00f7ff55":"#222"}`,borderRadius:6,
+              cursor:isActing?"pointer":"not-allowed",
+            }}>CHECK</button>
+          : <button onClick={handleCall} disabled={!isActing} style={{
+              flex:1.4,padding:"13px 0",fontSize:10,fontWeight:"bold",letterSpacing:2,
+              color:isActing?"#00f7ff":"#333",background:isActing?"#00f7ff18":"#111",
+              border:`2px solid ${isActing?"#00f7ff55":"#222"}`,borderRadius:6,
+              boxShadow:isActing?"0 0 10px #00f7ff33":undefined,
+              cursor:isActing?"pointer":"not-allowed",
+            }}>CALL {currentBet}</button>
+        }
+        <button
+          onClick={() => { if (!isActing) return; haptic("medium"); setRaiseOpen(r => !r); }}
+          disabled={!isActing}
+          style={{
+            flex:1.4,padding:"13px 0",fontSize:10,fontWeight:"bold",letterSpacing:2,
+            color:isActing?"#cc44ff":"#333",
+            background: raiseOpen?"#cc44ff33":isActing?"#cc44ff18":"#111",
+            border:`2px solid ${isActing?"#cc44ff66":"#222"}`,borderRadius:6,
+            boxShadow:isActing?"0 0 10px #cc44ff33":undefined,
+            cursor:isActing?"pointer":"not-allowed",
+          }}
+        >
+          RAISE {raiseOpen?"▼":"▲"}
+        </button>
+      </div>
+    )}
+  </div>
+</div>
+```
+
+);
+}

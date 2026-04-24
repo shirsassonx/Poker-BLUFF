@@ -1,0 +1,1560 @@
+================================================================
+FILE 1: artifacts/poker-bluff/src/pages/HoldemTable.tsx
+(Note: file is in pages/, not components/)
+================================================================
+import { useState, useEffect, useCallback, useRef } from "react";
+import { useLocation } from "wouter";
+import { usePokerSounds } from "../hooks/usePokerSounds";
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+type Suit  = "♠" | "♥" | "♦" | "♣";
+type Rank  = "2"|"3"|"4"|"5"|"6"|"7"|"8"|"9"|"10"|"J"|"Q"|"K"|"A";
+interface Card { suit: Suit; rank: Rank; value: number }
+type Phase = "idle"|"preflop"|"flop"|"turn"|"river"|"showdown";
+type BotAction = "fold"|"check"|"call"|"raise";
+interface PendingRaise { toCall: number; pot: number; botChips: number; ptr: number; d: Card[]; fromPhase: Phase }
+
+// ── Deck ──────────────────────────────────────────────────────────────────────
+const SUITS: Suit[] = ["♠","♥","♦","♣"];
+const RANKS: { rank: Rank; value: number }[] = [
+  {rank:"2",value:2},{rank:"3",value:3},{rank:"4",value:4},{rank:"5",value:5},
+  {rank:"6",value:6},{rank:"7",value:7},{rank:"8",value:8},{rank:"9",value:9},
+  {rank:"10",value:10},{rank:"J",value:11},{rank:"Q",value:12},{rank:"K",value:13},{rank:"A",value:14},
+];
+const RED: Suit[] = ["♥","♦"];
+
+function buildDeck(): Card[] {
+  return SUITS.flatMap(suit => RANKS.map(({ rank, value }) => ({ suit, rank, value })));
+}
+function shuffle(d: Card[]): Card[] {
+  const a = [...d];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// ── Hand evaluator ────────────────────────────────────────────────────────────
+function combos5(arr: Card[]): Card[][] {
+  if (arr.length < 5) return [];
+  if (arr.length === 5) return [arr];
+  const out: Card[][] = [];
+  for (let i = 0; i < arr.length - 4; i++)
+    for (let j = i+1; j < arr.length - 3; j++)
+      for (let k = j+1; k < arr.length - 2; k++)
+        for (let l = k+1; l < arr.length - 1; l++)
+          for (let m = l+1; m < arr.length; m++)
+            out.push([arr[i],arr[j],arr[k],arr[l],arr[m]]);
+  return out;
+}
+interface HandResult { rank: number; name: string; tb: number[] }
+function evalHand(c: Card[]): HandResult {
+  const vals = c.map(x => x.value).sort((a,b) => b-a);
+  const suits = c.map(x => x.suit);
+  const vc: Record<number,number> = {};
+  vals.forEach(v => vc[v] = (vc[v]??0)+1);
+  const cnts = Object.values(vc).sort((a,b) => b-a);
+  const uv   = [...new Set(vals)].sort((a,b) => b-a);
+  const flush = suits.every(s => s === suits[0]);
+  const str   = uv.length === 5 && uv[0]-uv[4] === 4;
+  const wheel = JSON.stringify(uv) === JSON.stringify([14,5,4,3,2]);
+  if (flush && (str||wheel)) return {rank:8, name:"STRAIGHT FLUSH", tb: wheel?[5,4,3,2,1]:vals};
+  if (cnts[0]===4)           return {rank:7, name:"FOUR OF A KIND",  tb:vals};
+  if (cnts[0]===3&&cnts[1]===2) return {rank:6, name:"FULL HOUSE",  tb:vals};
+  if (flush)                 return {rank:5, name:"FLUSH",           tb:vals};
+  if (str||wheel)            return {rank:4, name:"STRAIGHT",        tb: wheel?[5,4,3,2,1]:vals};
+  if (cnts[0]===3)           return {rank:3, name:"THREE OF A KIND", tb:vals};
+  if (cnts[0]===2&&cnts[1]===2) return {rank:2, name:"TWO PAIR",    tb:vals};
+  if (cnts[0]===2)           return {rank:1, name:"PAIR",            tb:vals};
+  return                          {rank:0, name:"HIGH CARD",         tb:vals};
+}
+function best7(cards: Card[]): HandResult {
+  const cs = combos5(cards);
+  if (!cs.length) return evalHand(cards.slice(0,5));
+  let best = evalHand(cs[0]);
+  for (const c of cs.slice(1)) {
+    const h = evalHand(c);
+    if (h.rank > best.rank) { best=h; continue; }
+    if (h.rank === best.rank) {
+      for (let i=0;i<h.tb.length;i++) {
+        if (h.tb[i] > best.tb[i]) { best=h; break; }
+        if (h.tb[i] < best.tb[i]) break;
+      }
+    }
+  }
+  return best;
+}
+function compareHands(p: Card[], b: Card[], com: Card[]): "player"|"bot"|"tie" {
+  const ph = best7([...p,...com]), bh = best7([...b,...com]);
+  if (ph.rank > bh.rank) return "player";
+  if (bh.rank > ph.rank) return "bot";
+  for (let i=0;i<ph.tb.length;i++) {
+    if (ph.tb[i] > bh.tb[i]) return "player";
+    if (bh.tb[i] > ph.tb[i]) return "bot";
+  }
+  return "tie";
+}
+
+// ── Chip Stack Visual ─────────────────────────────────────────────────────────
+const CHIP_COLORS = [
+  "#e0e0e0", // white   – lowest denom
+  "#e0e0e0",
+  "#e63946", // red
+  "#e63946",
+  "#2a6fdb", // blue
+  "#2a6fdb",
+  "#1a1a1a", // black   – highest denom
+  "#1a1a1a",
+];
+function ChipStack({ chips, maxChips }: { chips: number; maxChips: number }) {
+  const MAX_VISIBLE = 8;
+  const count = Math.min(MAX_VISIBLE, Math.max(chips > 0 ? 1 : 0, Math.round((chips / maxChips) * MAX_VISIBLE)));
+  return (
+    <div style={{
+      display: "flex",
+      flexDirection: "column-reverse",
+      alignItems: "center",
+      gap: 2,
+      width: 16,
+    }}>
+      {Array.from({ length: MAX_VISIBLE }).map((_, i) => (
+        <div
+          key={i}
+          style={{
+            width: 14,
+            height: 5,
+            borderRadius: 3,
+            background: CHIP_COLORS[Math.min(i, CHIP_COLORS.length - 1)],
+            border: "1px solid #00000055",
+            boxShadow: i < count ? "0 1px 3px #00000066" : "none",
+            flexShrink: 0,
+            opacity: i < count ? 1 : 0,
+            transform: i < count ? "scaleX(1)" : "scaleX(0.3)",
+            transition: "opacity 0.4s ease, transform 0.4s ease",
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
+// ── Bot AI ────────────────────────────────────────────────────────────────────
+function botDecide(pot:number, toCall:number, chips:number): {action:BotAction; amount:number} {
+  const r = Math.random();
+  // Bot folds only when there is something to call (12% chance)
+  if (r < 0.12 && toCall > 0)  return {action:"fold",  amount:0};
+  // Bot checks when there is nothing to call (35% chance)
+  if (r < 0.35 && toCall === 0) return {action:"check", amount:0};
+  // Bot calls (40% chance, or when fold/check didn't match)
+  if (r < 0.70)                 return {action:"call",  amount:Math.min(Math.max(toCall, BIG_BLIND), chips)};
+  // Bot raises (30% chance when no street bet, or re-raises)
+  const minRaise = Math.max(toCall * 2, BIG_BLIND * 2);
+  const raise = Math.min(Math.max(minRaise, Math.floor(pot * 0.5)), chips);
+  if (raise <= 0 || chips <= toCall) return {action:"call", amount:Math.min(toCall, chips)};
+  return {action:"raise", amount:raise};
+}
+
+// ── CSS injected once ─────────────────────────────────────────────────────────
+const CARD_CSS = `
+@keyframes dealIn {
+  0%   { transform:translateY(-40px) scale(0.7) rotate(-8deg); opacity:0; }
+  70%  { transform:translateY(4px) scale(1.04) rotate(1deg);   opacity:1; }
+  100% { transform:translateY(0)   scale(1)    rotate(0deg);   opacity:1; }
+}
+@keyframes cardFlip {
+  0%   { transform: perspective(400px) rotateY(90deg) scale(0.85); opacity:0; }
+  55%  { transform: perspective(400px) rotateY(-6deg) scale(1.04); opacity:1; }
+  100% { transform: perspective(400px) rotateY(0deg)  scale(1);    opacity:1; }
+}
+@keyframes overlayIn {
+  0%   { opacity:0; transform:scale(0.8); }
+  60%  { transform:scale(1.05); }
+  100% { opacity:1; transform:scale(1); }
+}
+@keyframes confettiFall {
+  0%   { transform:translateY(-20px) rotate(0deg);   opacity:1; }
+  100% { transform:translateY(110vh) rotate(720deg); opacity:0; }
+}
+@keyframes chipBounce {
+  0%,100% { transform:scale(1); }
+  50%      { transform:scale(1.18); }
+}
+@keyframes chipPop {
+  0%   { transform:scale(1) translateY(0); }
+  40%  { transform:scale(1.25) translateY(-6px); }
+  70%  { transform:scale(0.95) translateY(2px); }
+  100% { transform:scale(1) translateY(0); }
+}
+@keyframes chipFlyUp {
+  0%   { transform:translate(-50%,0)      scale(1);    opacity:1; }
+  75%  { transform:translate(-50%,-160px) scale(0.7);  opacity:1; }
+  100% { transform:translate(-50%,-190px) scale(0.4);  opacity:0; }
+}
+@keyframes chipFlyDown {
+  0%   { transform:translate(-50%,0)      scale(1);    opacity:1; }
+  75%  { transform:translate(-50%,160px)  scale(0.7);  opacity:1; }
+  100% { transform:translate(-50%,190px)  scale(0.4);  opacity:0; }
+}
+.card-deal    { animation: dealIn      0.35s cubic-bezier(.25,.46,.45,.94) both; }
+.card-flip    { animation: cardFlip    0.42s cubic-bezier(.25,.46,.45,.94) both; }
+.overlay-in   { animation: overlayIn   0.4s  cubic-bezier(.25,.46,.45,.94) both; }
+.chip-pop     { animation: chipPop     0.35s cubic-bezier(.25,.46,.45,.94) both; }
+.chip-fly-up  { animation: chipFlyUp   0.42s cubic-bezier(.4,0,.2,1) forwards; }
+.chip-fly-down{ animation: chipFlyDown 0.42s cubic-bezier(.4,0,.2,1) forwards; }
+`;
+
+// ── Card components ───────────────────────────────────────────────────────────
+function CardFace({ card, size="md", delay=0, flip=false }: { card:Card; size?:"sm"|"md"|"lg"; delay?:number; flip?:boolean }) {
+  const dim = size==="lg" ? {w:58,h:80,fRank:13,fSuit:28,fCorner:10}
+            : size==="sm" ? {w:44,h:62,fRank:10,fSuit:20,fCorner:8}
+            :               {w:52,h:72,fRank:11,fSuit:24,fCorner:9};
+  const red = RED.includes(card.suit);
+  const col = red ? "#cc0000" : "#111";
+  return (
+    <div
+      dir="ltr"
+      className={flip ? "card-flip" : "card-deal"}
+      style={{
+        width:dim.w, height:dim.h, flexShrink:0,
+        background:"linear-gradient(160deg,#fff 70%,#f5f5f5)",
+        border:`2px solid ${red?"#ffcccc":"#ccc"}`,
+        borderRadius:5,
+        boxShadow:`0 3px 12px #000c, 0 0 0 1px ${red?"#ff000022":"#00000011"}`,
+        position:"relative",
+        animationDelay:`${delay}s`,
+        overflow:"hidden",
+      }}
+    >
+      {/* top-left corner */}
+      <div style={{position:"absolute",top:3,left:4,lineHeight:1}}>
+        <div style={{fontSize:dim.fCorner,fontWeight:"bold",fontFamily:"monospace",color:col}}>{card.rank}</div>
+        <div style={{fontSize:dim.fCorner-1,color:col,marginTop:-1}}>{card.suit}</div>
+      </div>
+      {/* center suit */}
+      <div style={{
+        position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",
+        fontSize:dim.fSuit,color:col,
+        textShadow: red ? "0 0 8px #ff000044" : undefined,
+      }}>
+        {card.suit}
+      </div>
+      {/* bottom-right corner (rotated) */}
+      <div style={{position:"absolute",bottom:3,right:4,lineHeight:1,transform:"rotate(180deg)",textAlign:"left"}}>
+        <div style={{fontSize:dim.fCorner,fontWeight:"bold",fontFamily:"monospace",color:col}}>{card.rank}</div>
+        <div style={{fontSize:dim.fCorner-1,color:col,marginTop:-1}}>{card.suit}</div>
+      </div>
+      {/* subtle shine */}
+      <div style={{
+        position:"absolute",top:0,left:0,right:0,height:"40%",
+        background:"linear-gradient(180deg,rgba(255,255,255,0.4),transparent)",
+        pointerEvents:"none",
+      }}/>
+    </div>
+  );
+}
+
+function CardBack({ size="md" }: { size?:"sm"|"md"|"lg" }) {
+  const dim = size==="lg" ? {w:58,h:80} : size==="sm" ? {w:44,h:62} : {w:52,h:72};
+  return (
+    <div className="card-deal" style={{
+      width:dim.w, height:dim.h, flexShrink:0,
+      background:"repeating-linear-gradient(45deg,#0a0060 0,#0a0060 5px,#1500aa 5px,#1500aa 10px)",
+      border:"2px solid #6644ff",
+      borderRadius:5,
+      boxShadow:"0 3px 12px #000c,0 0 10px #6644ff44",
+      position:"relative",
+      overflow:"hidden",
+    }}>
+      <div style={{
+        position:"absolute",inset:4,border:"2px solid #ffffff22",borderRadius:3,
+        background:"radial-gradient(ellipse,#3300cc44,transparent)",
+      }}/>
+    </div>
+  );
+}
+
+function EmptySlot({ size="md" }: { size?:"sm"|"md"|"lg" }) {
+  const dim = size==="lg" ? {w:58,h:80} : size==="sm" ? {w:44,h:62} : {w:52,h:72};
+  return (
+    <div style={{
+      width:dim.w, height:dim.h, border:"2px dashed #ffffff18",
+      borderRadius:5, background:"#00000030",
+    }}/>
+  );
+}
+
+// ── Confetti ──────────────────────────────────────────────────────────────────
+const CONFETTI_COLORS = ["#ffd700","#ff44cc","#00f7ff","#00ff9d","#ff4444","#cc44ff","#ffffff"];
+function Confetti() {
+  const pieces = Array.from({length:30}, (_,i) => ({
+    id:i,
+    left: Math.random()*100,
+    delay: Math.random()*1.5,
+    dur:   2 + Math.random()*2,
+    size:  6 + Math.random()*8,
+    color: CONFETTI_COLORS[Math.floor(Math.random()*CONFETTI_COLORS.length)],
+    shape: Math.random() > 0.5 ? "50%" : "0",
+  }));
+  return (
+    <div style={{position:"fixed",inset:0,pointerEvents:"none",zIndex:200,overflow:"hidden"}}>
+      {pieces.map(p => (
+        <div key={p.id} style={{
+          position:"absolute",
+          left:`${p.left}%`,
+          top:-20,
+          width:p.size, height:p.size,
+          background:p.color,
+          borderRadius:p.shape,
+          animation:`confettiFall ${p.dur}s ${p.delay}s ease-in forwards`,
+        }}/>
+      ))}
+    </div>
+  );
+}
+
+// ── Win/Lose Overlay ──────────────────────────────────────────────────────────
+interface OverlayProps {
+  winner: "player"|"bot"|"tie";
+  message: string;
+  potWon: number;
+  onClose: () => void;
+}
+function ResultOverlay({ winner, message, potWon, onClose }: OverlayProps) {
+  const isWin  = winner === "player";
+  const isTie  = winner === "tie";
+  const emoji  = isWin ? "🏆" : isTie ? "🤝" : "💀";
+  const title  = isWin ? "YOU WIN!" : isTie ? "IT'S A TIE" : "BOT WINS";
+  const color  = isWin ? "#ffd700"  : isTie ? "#00f7ff"    : "#ff4444";
+  const glow   = isWin ? "#ffd70088": isTie ? "#00f7ff66"  : "#ff444466";
+  const bg     = isWin ? "#0d0900"  : isTie ? "#00101a"    : "#0d0000";
+  return (
+    <>
+      {isWin && <Confetti />}
+      {/* Backdrop */}
+      <div
+        onClick={onClose}
+        style={{
+          position:"fixed",inset:0,zIndex:100,
+          background:"rgba(0,0,0,0.75)",
+          backdropFilter:"blur(4px)",
+        }}
+      />
+      {/* Card */}
+      <div
+        className="overlay-in"
+        style={{
+          position:"fixed",
+          top:"50%",left:"50%",
+          transform:"translate(-50%,-50%)",
+          zIndex:110,
+          width:"min(340px,90vw)",
+          background:bg,
+          border:`4px solid ${color}`,
+          boxShadow:`0 0 60px ${glow}, 0 0 20px ${glow}`,
+          padding:"32px 24px",
+          textAlign:"center",
+        }}
+      >
+        {/* Emoji */}
+        <div style={{fontSize:64,lineHeight:1,marginBottom:12,
+          filter:`drop-shadow(0 0 16px ${color})`,
+        }}>
+          {emoji}
+        </div>
+        {/* Title */}
+        <div style={{
+          fontSize:22,fontWeight:"bold",letterSpacing:4,
+          color, textShadow:`0 0 20px ${color}`,
+          marginBottom:8,
+        }}>
+          {title}
+        </div>
+        {/* Pot info */}
+        {isWin && potWon > 0 && (
+          <div style={{
+            fontSize:14,fontWeight:"bold",letterSpacing:2,
+            color:"#ffd700",marginBottom:6,
+            animation:"chipBounce 0.6s ease infinite",
+            display:"inline-block",
+          }}>
+            +{potWon} CHIPS 💰
+          </div>
+        )}
+        {/* Hand result message */}
+        <div style={{
+          fontSize:9,letterSpacing:1,color:"#aaa",
+          margin:"12px 0 20px",lineHeight:1.6,
+        }}>
+          {message}
+        </div>
+        {/* Continue button */}
+        <button
+          onClick={onClose}
+          style={{
+            width:"100%",padding:"14px 0",
+            fontSize:11,fontWeight:"bold",letterSpacing:3,
+            color, background: `${color}22`,
+            border:`3px solid ${color}`,
+            boxShadow:`0 0 20px ${glow}`,
+            cursor:"pointer",
+          }}
+        >
+          CONTINUE ▶
+        </button>
+      </div>
+    </>
+  );
+}
+
+// ── Main component ────────────────────────────────────────────────────────────
+const INITIAL_CHIPS = 2000;
+const BIG_BLIND = 20;
+const SMALL_BLIND = 10;
+
+export default function HoldemTable() {
+  const [, navigate] = useLocation();
+
+  // inject CSS once
+  const cssRef = useRef(false);
+  if (!cssRef.current) {
+    cssRef.current = true;
+    const el = document.createElement("style");
+    el.textContent = CARD_CSS;
+    document.head.appendChild(el);
+  }
+
+  const sounds = usePokerSounds();
+  const { muted, toggleMute, volume, setVolume } = sounds;
+
+  const haptic = (style: "light"|"medium"|"heavy"|"rigid"|"soft" = "light") => {
+    try { window.Telegram?.WebApp?.hapticFeedback?.impactOccurred(style); } catch {}
+  };
+  const hapticNotify = (type: "success"|"error"|"warning") => {
+    try { window.Telegram?.WebApp?.hapticFeedback?.notificationOccurred(type); } catch {}
+  };
+
+  const [deck,        setDeck]        = useState<Card[]>([]);
+  const [playerHand,  setPlayerHand]  = useState<Card[]>([]);
+  const [botHand,     setBotHand]     = useState<Card[]>([]);
+  const [community,   setCommunity]   = useState<Card[]>([]);
+  const [phase,       setPhase]       = useState<Phase>("idle");
+  const [deckPtr,     setDeckPtr]     = useState(0);
+
+  const [playerChips, setPlayerChips] = useState(INITIAL_CHIPS);
+  const [botChips,    setBotChips]    = useState(INITIAL_CHIPS);
+  const [pot,         setPot]         = useState(0);
+  const [currentBet,  setCurrentBet]  = useState(0);
+  const [betInput,    setBetInput]    = useState(BIG_BLIND);
+
+  const [handName,    setHandName]    = useState("");
+  const [message,     setMessage]     = useState("Press DEAL to start");
+  const [botFolded,   setBotFolded]   = useState(false);
+  const [botActionLabel, setBotActionLabel] = useState("");
+  const [showdown,    setShowdown]    = useState(false);
+  const [winner,      setWinner]      = useState<"player"|"bot"|"tie"|"">("");
+  const [overlay,     setOverlay]     = useState(false);
+  const [overlayMsg,  setOverlayMsg]  = useState("");
+  const [potWon,      setPotWon]      = useState(0);
+
+  // bot raise: player must respond (call/fold)
+  const [pendingBotRaise, setPendingBotRaise] = useState<PendingRaise | null>(null);
+
+  // flying chip animations
+  const [flyingChips, setFlyingChips] = useState<{ id: number; from: "player" | "bot" }[]>([]);
+  const chipIdRef = useRef(0);
+  const spawnChip = useCallback((from: "player" | "bot") => {
+    const id = ++chipIdRef.current;
+    setFlyingChips(prev => [...prev, { id, from }]);
+  }, []);
+
+  // Telegram user ID for chip persistence
+  const [tgId, setTgId] = useState<number | null>(null);
+
+  // Load Telegram ID + chips from API on mount
+  useEffect(() => {
+    const uid = window.Telegram?.WebApp?.initDataUnsafe?.user?.id ?? null;
+    if (!uid) return;
+    setTgId(uid);
+    fetch(`/api/player/profile?telegramId=${uid}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (data && typeof data.chips === "number") {
+          setPlayerChips(data.chips > 0 ? data.chips : INITIAL_CHIPS);
+        }
+      })
+      .catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // update hand name live
+  useEffect(() => {
+    if (playerHand.length < 2) return;
+    const all = [...playerHand, ...community];
+    setHandName(all.length >= 5 ? best7(all).name : evalHand(playerHand).name);
+  }, [playerHand, community]);
+
+  // play deal sound when community cards are revealed
+  useEffect(() => {
+    if (community.length > 0) {
+      sounds.playDeal();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [community.length]);
+
+  // play win / lose sounds + haptic when overlay appears
+  useEffect(() => {
+    if (!overlay || !winner) return;
+    if (winner === "player") {
+      sounds.playWin();
+      hapticNotify("success");
+    } else if (winner === "bot") {
+      sounds.playLose();
+      hapticNotify("error");
+    } else {
+      hapticNotify("warning");
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [overlay]);
+
+  // ── Telegram game-result notification ─────────────────────────────────────
+  const sendGameResult = useCallback((tid: number | null, result: "player"|"bot"|"tie", handName: string, won: number) => {
+    if (!tid) return;
+    fetch("/api/telegram/game-result", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({ telegramId:tid, winner:result, handName, potWon:won }),
+    }).catch(()=>{});
+  }, []);
+
+  // ── Save chips to DB ───────────────────────────────────────────────────────
+  const saveChips = useCallback((chips: number, tid: number | null) => {
+    if (!tid) return;
+    fetch("/api/player/chips", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ telegramId: tid, chips }),
+    }).catch(() => {});
+  }, []);
+
+  // ── Advance phase ──────────────────────────────────────────────────────────
+  const advancePhase = useCallback((
+    fromPhase: Phase, ptr: number, d: Card[],
+    currentPot: number, currentBotChips: number,
+  ) => {
+    setCurrentBet(0);
+    setBetInput(BIG_BLIND);
+    setPendingBotRaise(null);
+    if (fromPhase === "preflop") {
+      const flop = [d[ptr], d[ptr+1], d[ptr+2]];
+      setCommunity(flop); setDeckPtr(ptr+3); setPhase("flop");
+      setMessage("FLOP — your action.");
+    } else if (fromPhase === "flop") {
+      setCommunity(prev => [...prev, d[ptr]]); setDeckPtr(ptr+1); setPhase("turn");
+      setMessage("TURN — your action.");
+    } else if (fromPhase === "turn") {
+      setCommunity(prev => [...prev, d[ptr]]); setDeckPtr(ptr+1); setPhase("river");
+      setMessage("RIVER — your action.");
+    } else if (fromPhase === "river") {
+      setPhase("showdown"); setShowdown(true);
+      setCommunity(prev => {
+        const com = prev;
+        setPlayerHand(ph => {
+          setBotHand(bh => {
+            const result = compareHands(ph, bh, com);
+            const pB = best7([...ph,...com]);
+            const bB = best7([...bh,...com]);
+            setWinner(result);
+            let msg = "";
+            let won = 0;
+            if (result === "player") {
+              setPlayerChips(p => {
+                const next = p + currentPot;
+                setTimeout(() => saveChips(next, tgId), 300);
+                return next;
+              });
+              setPot(0);
+              msg = `${pB.name} beats ${bB.name}!`;
+              won = currentPot;
+            } else if (result === "bot") {
+              setBotChips(currentBotChips + currentPot); setPot(0);
+              msg = `Bot wins with ${bB.name} vs your ${pB.name}`;
+              setPlayerChips(p => { setTimeout(() => saveChips(p, tgId), 300); return p; });
+            } else {
+              const half = Math.floor(currentPot/2);
+              setPlayerChips(p => {
+                const next = p + half;
+                setTimeout(() => saveChips(next, tgId), 300);
+                return next;
+              });
+              setBotChips(currentBotChips + half); setPot(0);
+              msg = `Both have ${pB.name}`;
+              won = half;
+            }
+            setPotWon(won); setOverlayMsg(msg);
+            setTimeout(() => setOverlay(true), 400);
+            sendGameResult(tgId, result, result==="player"?pB.name:result==="bot"?bB.name:pB.name, won);
+            return bh;
+          });
+          return ph;
+        });
+        return com;
+      });
+    }
+  }, [tgId, saveChips, sendGameResult]);
+
+  // ── Bot turn ───────────────────────────────────────────────────────────────
+  const runBotTurn = useCallback((
+    currentPot: number, toCall: number, currentBotChips: number,
+    ptr: number, _com: Card[], d: Card[], fromPhase: Phase,
+  ) => {
+    setTimeout(() => {
+      const { action, amount } = botDecide(currentPot, toCall, currentBotChips);
+      setBotActionLabel(action.toUpperCase());
+
+      if (action === "fold") {
+        setBotFolded(true); setPhase("showdown"); setShowdown(true); setWinner("player");
+        setPlayerChips(p => {
+          const next = p + currentPot;
+          return next;
+        });
+        setPot(0);
+        setPotWon(currentPot); setOverlayMsg("Bot folded — the pot is yours!");
+        setTimeout(() => setOverlay(true), 300);
+        sendGameResult(tgId, "player", "Bot folded", currentPot);
+        return;
+      }
+
+      if (action === "check") {
+        // Bot checks — advance the street
+        advancePhase(fromPhase, ptr, d, currentPot, currentBotChips);
+        return;
+      }
+
+      if (action === "call") {
+        // Bot calls the player's bet — advance the street
+        const paid = Math.min(amount, currentBotChips);
+        const newPot = currentPot + paid;
+        const newBotChips = currentBotChips - paid;
+        spawnChip("bot");
+        setPot(newPot); setBotChips(newBotChips);
+        advancePhase(fromPhase, ptr, d, newPot, newBotChips);
+        return;
+      }
+
+      if (action === "raise") {
+        // Bot raises — player must respond (call or fold)
+        const paid = Math.min(amount, currentBotChips);
+        const newPot = currentPot + paid;
+        const newBotChips = currentBotChips - paid;
+        spawnChip("bot");
+        setPot(newPot); setBotChips(newBotChips);
+        setCurrentBet(paid);
+        setMessage(`Bot raises ${paid} — call or fold?`);
+        setPendingBotRaise({ toCall: paid, pot: newPot, botChips: newBotChips, ptr, d, fromPhase });
+        return;
+      }
+    }, 900);
+  }, [advancePhase, spawnChip]);
+
+  // ── Deal new hand ──────────────────────────────────────────────────────────
+  const dealNewHand = useCallback(() => {
+    haptic("medium");
+    sounds.playDeal();
+    const d = shuffle(buildDeck());
+    const ph: Card[] = [d[0], d[2]];
+    const bh: Card[] = [d[1], d[3]];
+    setDeck(d); setDeckPtr(4);
+    setPlayerHand(ph); setBotHand(bh);
+    setCommunity([]); setPhase("preflop");
+    setShowdown(false); setBotFolded(false);
+    setBotActionLabel(""); setWinner(""); setOverlay(false);
+    setPendingBotRaise(null);
+    setPot(BIG_BLIND + SMALL_BLIND); // collect blinds upfront
+    setPlayerChips(p => p - SMALL_BLIND);
+    setBotChips(p => p - BIG_BLIND);
+    setCurrentBet(BIG_BLIND); setBetInput(BIG_BLIND * 2);
+    setMessage("Pre-flop — call, raise, or fold.");
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sounds]);
+
+  // ── Player actions ─────────────────────────────────────────────────────────
+  const isActing = phase !== "showdown" && phase !== "idle";
+
+  const handleFold = () => {
+    if (!isActing) return;
+    haptic("heavy");
+    sounds.playFold();
+    hapticNotify("error");
+    setPendingBotRaise(null);
+    const winnerChips = botChips + pot;
+    setBotChips(winnerChips); setPot(0);
+    setPhase("showdown"); setShowdown(true); setWinner("bot");
+    setPotWon(0); setOverlayMsg("You folded. Better luck next hand!");
+    setTimeout(() => setOverlay(true), 200);
+    sendGameResult(tgId, "bot", "You folded", 0);
+  };
+  const handleCheck = () => {
+    if (!isActing || pendingBotRaise) return;
+    haptic("light");
+    sounds.playCheck();
+    setMessage("You check.");
+    runBotTurn(pot, 0, botChips, deckPtr, community, deck, phase);
+  };
+  const handleCall = () => {
+    if (!isActing) return;
+    haptic("medium");
+    sounds.playChip();
+    spawnChip("player");
+    // If responding to a bot raise, use that context
+    if (pendingBotRaise) {
+      const { toCall, pot: rPot, botChips: rBotChips, ptr, d, fromPhase } = pendingBotRaise;
+      const paid = Math.min(toCall, playerChips);
+      setPlayerChips(p => p - paid);
+      const newPot = rPot + paid;
+      setPot(newPot);
+      setMessage(`You call ${paid}.`);
+      advancePhase(fromPhase, ptr, d, newPot, rBotChips);
+      return;
+    }
+    const amount = Math.min(currentBet || BIG_BLIND, playerChips);
+    setPlayerChips(p => p - amount);
+    const newPot = pot + amount;
+    setPot(newPot);
+    setMessage(`You call ${amount}.`);
+    runBotTurn(newPot, 0, botChips, deckPtr, community, deck, phase);
+  };
+  const handleRaise = () => {
+    if (!isActing || betInput <= 0 || pendingBotRaise) return;
+    haptic("rigid");
+    sounds.playChip();
+    const amount = Math.min(betInput, playerChips);
+    if (amount <= 0) return;
+    spawnChip("player");
+    setPlayerChips(p => p - amount);
+    const newPot = pot + amount;
+    setPot(newPot); setCurrentBet(amount);
+    setMessage(`You raise ${amount}.`);
+    runBotTurn(newPot, amount, botChips, deckPtr, community, deck, phase);
+  };
+
+  const needsReload = playerChips < BIG_BLIND && phase === "showdown";
+  const reloadChips = () => {
+    haptic("medium");
+    sounds.playChip();
+    setPlayerChips(INITIAL_CHIPS); setBotChips(INITIAL_CHIPS);
+    setPot(0); setPhase("idle"); setOverlay(false);
+    setPlayerHand([]); setBotHand([]); setCommunity([]);
+    setMessage("Chips reloaded — press DEAL.");
+  };
+
+  const closeOverlay = () => {
+    haptic("light");
+    setOverlay(false);
+  };
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+  const actionBtnStyle = (color: string, disabled: boolean) => ({
+    flex:1, padding:"12px 0",
+    fontSize:10, fontWeight:"bold" as const, letterSpacing:2,
+    color: disabled ? "#444" : color,
+    background: disabled ? "#111" : `${color}18`,
+    border: `2px solid ${disabled ? "#333" : color}`,
+    boxShadow: disabled ? undefined : `0 0 12px ${color}44`,
+    cursor: disabled ? "not-allowed" : "pointer",
+    transition:"all 0.15s",
+  });
+
+  const isAllIn = betInput >= playerChips;
+
+  return (
+    <div dir="ltr" style={{background:"#0a0a14",height:"100dvh",overflow:"hidden",display:"flex",flexDirection:"column",maxWidth:480,margin:"0 auto"}}>
+
+      {/* Overlays */}
+      {overlay && winner && (
+        <ResultOverlay
+          winner={winner as "player"|"bot"|"tie"}
+          message={overlayMsg}
+          potWon={potWon}
+          onClose={closeOverlay}
+        />
+      )}
+
+      {/* ── Header ──────────────────────────────────────────────────────────── */}
+      <div style={{display:"flex",alignItems:"center",gap:12,padding:"10px 16px",background:"#070007",borderBottom:"3px solid #2a0044",flexShrink:0}}>
+        <button
+          onClick={() => { haptic("light"); navigate("/"); }}
+          style={{fontSize:10,fontWeight:"bold",padding:"6px 12px",border:"2px solid #ff4444",color:"#ff4444",background:"#1a0000",cursor:"pointer",flexShrink:0}}
+        >
+          ✕ EXIT
+        </button>
+        <div style={{flex:1,textAlign:"center",fontSize:14,fontWeight:"bold",letterSpacing:4,color:"#00f7ff",textShadow:"0 0 14px #00f7ff"}}>
+          HOLD'EM
+        </div>
+        <div style={{fontSize:10,fontWeight:"bold",padding:"6px 12px",border:"2px solid #ffd700",color:"#ffd700",background:"#1a1200",flexShrink:0}}>
+          POT: {pot}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+          <button
+            onClick={() => { haptic("light"); toggleMute(); }}
+            title={muted ? "Unmute sounds" : "Mute sounds"}
+            aria-label={muted ? "Unmute sounds" : "Mute sounds"}
+            aria-pressed={muted}
+            style={{
+              fontSize:16,
+              padding:"4px 8px",
+              border:`2px solid ${muted ? "#555" : "#00f7ff"}`,
+              color: muted ? "#555" : "#00f7ff",
+              background: muted ? "#111" : "#00f7ff18",
+              cursor:"pointer",
+              flexShrink:0,
+              lineHeight:1,
+              boxShadow: muted ? undefined : "0 0 8px #00f7ff44",
+            }}
+          >
+            {muted ? "🔇" : "🔊"}
+          </button>
+          <input
+            type="range"
+            min={0}
+            max={100}
+            value={volume}
+            disabled={muted}
+            onChange={e => setVolume(Number(e.target.value))}
+            title={`Volume: ${volume}%`}
+            aria-label="Volume"
+            style={{
+              width:64,
+              accentColor:"#00f7ff",
+              opacity: muted ? 0.3 : 1,
+              cursor: muted ? "not-allowed" : "pointer",
+            }}
+          />
+        </div>
+      </div>
+
+      {/* ── Phase bar ───────────────────────────────────────────────────────── */}
+      <div style={{display:"flex",justifyContent:"center",gap:8,padding:"8px",background:"#0d0d0d",flexShrink:0}}>
+        {(["preflop","flop","turn","river"] as Phase[]).map(p => {
+          const phaseOrder = ["preflop","flop","turn","river","showdown"];
+          const cur = phaseOrder.indexOf(phase);
+          const tgt = phaseOrder.indexOf(p);
+          const active = phase === p;
+          const passed = cur > tgt && cur >= 0;
+          return (
+            <div key={p} style={{
+              fontSize:8,padding:"3px 8px",fontWeight:"bold",letterSpacing:2,
+              color: active?"#ffd700": passed?"#00ff9d":"#333",
+              border:`1px solid ${active?"#ffd700":passed?"#00ff9d33":"#1a1a1a"}`,
+              background: active?"#1a1200":"transparent",
+              textShadow: active?"0 0 8px #ffd700":undefined,
+            }}>
+              {p.toUpperCase()}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* ── Full-height poker table (felt) ──────────────────────────────────── */}
+      <div style={{
+        flex:1, display:"flex", flexDirection:"column",
+        background:"radial-gradient(ellipse 120% 120% at 50% 50%,#1d6b1d 0%,#124a12 45%,#082608 100%)",
+        borderTop:"4px solid #2a5a2a",
+        borderBottom:"4px solid #2a5a2a",
+        boxShadow:"inset 0 0 80px #000c, inset 0 0 30px #00500022",
+        overflow:"hidden",
+        position:"relative",
+      }}>
+
+        {/* Oval table outline decoration */}
+        <div style={{
+          position:"absolute", inset:"8%", border:"3px solid #ffffff0a",
+          borderRadius:"50%", pointerEvents:"none",
+        }}/>
+
+        {/* ── BOT row ──────────────────────────────────────────────────────── */}
+        <div style={{
+          display:"flex", flexDirection:"column", alignItems:"center", gap:4,
+          padding:"8px 16px 6px", flexShrink:0,
+        }}>
+          {/* Bot info bar */}
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <span style={{fontSize:7,letterSpacing:2,color:"#ffffff66"}}>🤖 BOT</span>
+            <span style={{fontSize:12,fontWeight:"bold",color:"#ff88ee",textShadow:"0 0 8px #ff44cc66"}}>
+              {botChips.toLocaleString()}
+            </span>
+            {botActionLabel && (
+              <span style={{
+                fontSize:8, fontWeight:"bold", padding:"2px 8px",
+                color: botActionLabel==="FOLD"?"#ff4444":botActionLabel==="RAISE"?"#ffd700":"#00f7ff",
+                border:"1px solid currentColor", background:"#00000099",
+                letterSpacing:1,
+              }}>
+                {botActionLabel}
+              </span>
+            )}
+          </div>
+          {/* Bot cards */}
+          <div style={{display:"flex",gap:8}}>
+            {phase==="idle"
+              ? <><EmptySlot size="md"/><EmptySlot size="md"/></>
+              : showdown && !botFolded
+              ? botHand.map((c,i) => <CardFace key={i} card={c} size="md" delay={i*0.08} flip />)
+              : botFolded
+              ? <><EmptySlot size="md"/><EmptySlot size="md"/></>
+              : <><CardBack size="md"/><CardBack size="md"/></>
+            }
+          </div>
+        </div>
+
+        {/* ── Center: community cards + pot ────────────────────────────────── */}
+        <div style={{
+          flex:1, display:"flex", flexDirection:"column",
+          alignItems:"center", justifyContent:"center", gap:10,
+        }}>
+          {/* Community cards */}
+          <div style={{display:"flex",gap:6,alignItems:"center",justifyContent:"center"}}>
+            {[0,1,2,3,4].map(i =>
+              community[i]
+                ? <CardFace key={i} card={community[i]} size="md" delay={i*0.1}/>
+                : <EmptySlot key={i} size="md"/>
+            )}
+          </div>
+
+          {/* Pot chip */}
+          {pot > 0 && (
+            <div key={pot} className="chip-pop" style={{
+              display:"flex", alignItems:"center", gap:6,
+              background:"#00000066", border:"1px solid #ffd70044",
+              padding:"4px 14px", borderRadius:20,
+            }}>
+              <span style={{fontSize:14}}>🪙</span>
+              <span style={{fontSize:11,fontWeight:"bold",letterSpacing:2,color:"#ffd700",textShadow:"0 0 10px #ffd700"}}>
+                {pot.toLocaleString()}
+              </span>
+            </div>
+          )}
+
+          {/* Status message */}
+          <div style={{
+            fontSize:8, color:"#ffffffaa", letterSpacing:1,
+            textAlign:"center", maxWidth:260, lineHeight:1.6,
+            background:"#00000033", padding:"4px 12px",
+          }}>
+            {pendingBotRaise
+              ? `⚠️ BOT RAISES ${pendingBotRaise.toCall} — CALL OR FOLD?`
+              : message}
+          </div>
+        </div>
+
+        {/* ── Flying chip animations ───────────────────────────────────────── */}
+        {flyingChips.map(chip => (
+          <div
+            key={chip.id}
+            className={chip.from === "player" ? "chip-fly-up" : "chip-fly-down"}
+            onAnimationEnd={() => setFlyingChips(prev => prev.filter(c => c.id !== chip.id))}
+            style={{
+              position: "absolute",
+              left: "50%",
+              ...(chip.from === "player" ? { bottom: "22%" } : { top: "22%" }),
+              fontSize: 20,
+              pointerEvents: "none",
+              zIndex: 10,
+              willChange: "transform, opacity",
+              filter: "drop-shadow(0 0 6px #ffd70099)",
+            }}
+          >
+            🪙
+          </div>
+        ))}
+
+        {/* ── PLAYER row ───────────────────────────────────────────────────── */}
+        <div style={{
+          display:"flex", flexDirection:"column", alignItems:"center", gap:4,
+          padding:"6px 16px 8px", flexShrink:0,
+        }}>
+          {/* Player cards — always face-up */}
+          <div style={{display:"flex",gap:10}}>
+            {phase==="idle"
+              ? <><EmptySlot size="lg"/><EmptySlot size="lg"/></>
+              : playerHand.map((c,i) => <CardFace key={i} card={c} size="lg" delay={i*0.1}/>)
+            }
+          </div>
+
+          {/* Player info bar */}
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            {handName && phase!=="idle" && (
+              <span style={{
+                fontSize:8, fontWeight:"bold", padding:"2px 8px",
+                color:"#00f7ff", border:"1px solid #00f7ff44", background:"#00000066",
+                letterSpacing:1,
+              }}>
+                {handName}
+              </span>
+            )}
+            <span style={{fontSize:7,letterSpacing:2,color:"#ffffff66"}}>YOU</span>
+            <span style={{fontSize:13,fontWeight:"bold",color:"#00ff9d",textShadow:"0 0 8px #00ff9d66"}}>
+              {playerChips.toLocaleString()}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Controls ────────────────────────────────────────────────────────── */}
+      <div dir="ltr" style={{padding:"10px 12px 16px",background:"#08000f",borderTop:"2px solid #1a0033",flexShrink:0}}>
+
+        {/* Bet slider — hidden when bot raised (player must call/fold) */}
+        {!pendingBotRaise && (
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,padding:"6px 0",borderBottom:"1px solid #1a1a1a"}}>
+            <button
+              onClick={() => { haptic("light"); setBetInput(Math.max(BIG_BLIND, Math.floor(pot/2))); }}
+              style={{fontSize:8,fontWeight:"bold",padding:"5px 8px",border:"1px solid #555",color:"#999",background:"#111",cursor:"pointer",flexShrink:0}}
+            >
+              ½ POT
+            </button>
+            <input
+              type="range"
+              dir="ltr"
+              min={BIG_BLIND}
+              max={Math.max(playerChips, BIG_BLIND)}
+              step={10}
+              value={betInput}
+              onChange={e => { haptic("light"); setBetInput(Number(e.target.value)); }}
+              style={{flex:1,accentColor:"#ffd700",cursor:"pointer"}}
+            />
+            <button
+              onClick={() => { haptic("light"); setBetInput(playerChips); }}
+              style={{fontSize:8,fontWeight:"bold",padding:"5px 8px",border:"1px solid #ffd700",color:"#ffd700",background:"#111",cursor:"pointer",flexShrink:0}}
+            >
+              ALL-IN
+            </button>
+            <div style={{fontSize:12,fontWeight:"bold",color:"#ffd700",width:44,textAlign:"right",flexShrink:0}}>
+              {betInput}
+            </div>
+          </div>
+        )}
+
+        {/* Action buttons */}
+        {phase==="idle" || phase==="showdown" ? (
+          <div style={{display:"flex",gap:8}}>
+            {needsReload && (
+              <button onClick={reloadChips} style={{...actionBtnStyle("#00f7ff",false),flex:1}}>
+                💰 BUY CHIPS
+              </button>
+            )}
+            <button
+              onClick={dealNewHand}
+              disabled={playerChips < BIG_BLIND}
+              style={actionBtnStyle("#00ff9d", playerChips < BIG_BLIND)}
+            >
+              🃏 DEAL NEW HAND
+            </button>
+          </div>
+        ) : pendingBotRaise ? (
+          // Bot raised — player must respond
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={handleFold} style={actionBtnStyle("#ff4444", false)}>
+              FOLD
+            </button>
+            <button onClick={handleCall} style={{...actionBtnStyle("#00ff9d", false),flex:2}}>
+              CALL {Math.min(pendingBotRaise.toCall, playerChips)}
+            </button>
+          </div>
+        ) : (
+          <div style={{display:"flex",gap:6}}>
+            <button onClick={handleFold}  disabled={!isActing} style={actionBtnStyle("#ff4444", !isActing)}>FOLD</button>
+            <button onClick={handleCheck} disabled={!isActing || currentBet > 0} style={actionBtnStyle("#00f7ff", !isActing || currentBet > 0)}>CHECK</button>
+            <button onClick={handleCall}  disabled={!isActing || currentBet === 0} style={actionBtnStyle("#00ff9d", !isActing || currentBet === 0)}>CALL</button>
+            <button onClick={handleRaise} disabled={!isActing || betInput > playerChips || betInput < BIG_BLIND} style={actionBtnStyle("#ffd700", !isActing || betInput > playerChips || betInput < BIG_BLIND)}>RAISE</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+================================================================
+FILE 2: artifacts/poker-bluff/src/index.css
+================================================================
+@import url("https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap");
+@import "tailwindcss";
+@import "tw-animate-css";
+@plugin "@tailwindcss/typography";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-card-border: hsl(var(--card-border));
+
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-popover-border: hsl(var(--popover-border));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-primary-border: var(--primary-border);
+
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-secondary-border: var(--secondary-border);
+
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-muted-border: var(--muted-border);
+
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-accent-border: var(--accent-border);
+
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-destructive-border: var(--destructive-border);
+
+  --color-chart-1: hsl(var(--chart-1));
+  --color-chart-2: hsl(var(--chart-2));
+  --color-chart-3: hsl(var(--chart-3));
+  --color-chart-4: hsl(var(--chart-4));
+  --color-chart-5: hsl(var(--chart-5));
+
+  --color-sidebar: hsl(var(--sidebar));
+  --color-sidebar-foreground: hsl(var(--sidebar-foreground));
+  --color-sidebar-border: hsl(var(--sidebar-border));
+  --color-sidebar-primary: hsl(var(--sidebar-primary));
+  --color-sidebar-primary-foreground: hsl(var(--sidebar-primary-foreground));
+  --color-sidebar-primary-border: var(--sidebar-primary-border);
+  --color-sidebar-accent: hsl(var(--sidebar-accent));
+  --color-sidebar-accent-foreground: hsl(var(--sidebar-accent-foreground));
+  --color-sidebar-accent-border: var(--sidebar-accent-border);
+  --color-sidebar-ring: hsl(var(--sidebar-ring));
+
+  --font-sans: var(--app-font-sans);
+  --font-serif: var(--app-font-serif);
+  --font-mono: var(--app-font-mono);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+/* LIGHT MODE */
+:root {
+  --button-outline: rgba(0,0,0, .10);
+  --badge-outline: rgba(0,0,0, .05);
+
+  --opaque-button-border-intensity: -8;
+
+  --elevate-1: rgba(0,0,0, .03);
+  --elevate-2: rgba(0,0,0, .08);
+
+  --background: 0 0% 4%;
+  --foreground: 0 0% 100%;
+  --border: 0 0% 15%;
+  
+  --card: 0 0% 7%;
+  --card-foreground: 0 0% 100%;
+  --card-border: 0 0% 15%;
+
+  --sidebar: 0 0% 7%;
+  --sidebar-foreground: 0 0% 100%;
+  --sidebar-border: 0 0% 15%;
+  --sidebar-primary: 182 100% 50%;
+  --sidebar-primary-foreground: 0 0% 0%;
+  --sidebar-accent: 0 0% 15%;
+  --sidebar-accent-foreground: 0 0% 100%;
+  --sidebar-ring: 182 100% 50%;
+
+  --popover: 0 0% 7%;
+  --popover-foreground: 0 0% 100%;
+  --popover-border: 0 0% 15%;
+
+  --primary: 182 100% 50%;
+  --primary-foreground: 0 0% 0%;
+
+  --secondary: 286 100% 50%;
+  --secondary-foreground: 0 0% 100%;
+
+  --muted: 0 0% 15%;
+  --muted-foreground: 0 0% 60%;
+
+  --accent: 157 100% 50%;
+  --accent-foreground: 0 0% 0%;
+
+  --destructive: 0 100% 50%;
+  --destructive-foreground: 0 0% 100%;
+
+  --input: 0 0% 15%;
+  --ring: 182 100% 50%;
+  --chart-1: 182 100% 50%;
+  --chart-2: 286 100% 50%;
+  --chart-3: 157 100% 50%;
+  --chart-4: 54 100% 50%;
+  --chart-5: 0 100% 50%;
+
+  --app-font-sans: 'Press Start 2P', system-ui;
+  --app-font-serif: Georgia, serif;
+  --app-font-mono: Menlo, monospace;
+  --radius: .5rem;
+  --shadow-2xs: 0px 2px 0px 0px hsl(202.8169 89.1213% 53.1373% / 0.00);
+  --shadow-xs: 0px 2px 0px 0px hsl(202.8169 89.1213% 53.1373% / 0.00);
+  --shadow-sm: 0px 2px 0px 0px hsl(202.8169 89.1213% 53.1373% / 0.00), 0px 1px 2px -1px hsl(202.8169 89.1213% 53.1373% / 0.00);
+  --shadow: 0px 2px 0px 0px hsl(202.8169 89.1213% 53.1373% / 0.00), 0px 1px 2px -1px hsl(202.8169 89.1213% 53.1373% / 0.00);
+  --shadow-md: 0px 2px 0px 0px hsl(202.8169 89.1213% 53.1373% / 0.00), 0px 2px 4px -1px hsl(202.8169 89.1213% 53.1373% / 0.00);
+  --shadow-lg: 0px 2px 0px 0px hsl(202.8169 89.1213% 53.1373% / 0.00), 0px 4px 6px -1px hsl(202.8169 89.1213% 53.1373% / 0.00);
+  --shadow-xl: 0px 2px 0px 0px hsl(202.8169 89.1213% 53.1373% / 0.00), 0px 8px 10px -1px hsl(202.8169 89.1213% 53.1373% / 0.00);
+  --shadow-2xl: 0px 2px 0px 0px hsl(202.8169 89.1213% 53.1373% / 0.00);
+  --tracking-normal: 0em;
+  --spacing: 0.25rem;
+
+  --sidebar-primary-border: hsl(var(--sidebar-primary));
+  --sidebar-primary-border: hsl(from hsl(var(--sidebar-primary)) h s calc(l + var(--opaque-button-border-intensity)) / alpha);
+  --sidebar-accent-border: hsl(var(--sidebar-accent));
+  --sidebar-accent-border: hsl(from hsl(var(--sidebar-accent)) h s calc(l + var(--opaque-button-border-intensity)) / alpha);
+  --primary-border: hsl(var(--primary));
+  --primary-border: hsl(from hsl(var(--primary)) h s calc(l + var(--opaque-button-border-intensity)) / alpha);
+  --secondary-border: hsl(var(--secondary));
+  --secondary-border: hsl(from hsl(var(--secondary)) h s calc(l + var(--opaque-button-border-intensity)) / alpha);
+  --muted-border: hsl(var(--muted));
+  --muted-border: hsl(from hsl(var(--muted)) h s calc(l + var(--opaque-button-border-intensity)) / alpha);
+  --accent-border: hsl(var(--accent));
+  --accent-border: hsl(from hsl(var(--accent)) h s calc(l + var(--opaque-button-border-intensity)) / alpha);
+  --destructive-border: hsl(var(--destructive));
+  --destructive-border: hsl(from hsl(var(--destructive)) h s calc(l + var(--opaque-button-border-intensity)) / alpha);
+}
+
+.dark {
+  --button-outline: rgba(255,255,255, .10);
+  --badge-outline: rgba(255,255,255, .05);
+  --opaque-button-border-intensity: 9;
+  --elevate-1: rgba(255,255,255, .04);
+  --elevate-2: rgba(255,255,255, .09);
+
+  --background: 0 0% 4%;
+  --foreground: 0 0% 100%;
+  --border: 0 0% 15%;
+  --card: 0 0% 7%;
+  --card-foreground: 0 0% 100%;
+  --card-border: 0 0% 15%;
+  --sidebar: 0 0% 7%;
+  --sidebar-foreground: 0 0% 100%;
+  --sidebar-border: 0 0% 15%;
+  --sidebar-primary: 182 100% 50%;
+  --sidebar-primary-foreground: 0 0% 0%;
+  --sidebar-accent: 0 0% 15%;
+  --sidebar-accent-foreground: 0 0% 100%;
+  --sidebar-ring: 182 100% 50%;
+  --popover: 0 0% 7%;
+  --popover-foreground: 0 0% 100%;
+  --popover-border: 0 0% 15%;
+  --primary: 182 100% 50%;
+  --primary-foreground: 0 0% 0%;
+  --secondary: 286 100% 50%;
+  --secondary-foreground: 0 0% 100%;
+  --muted: 0 0% 15%;
+  --muted-foreground: 0 0% 60%;
+  --accent: 157 100% 50%;
+  --accent-foreground: 0 0% 0%;
+  --destructive: 0 100% 50%;
+  --destructive-foreground: 0 0% 100%;
+  --input: 0 0% 15%;
+  --ring: 182 100% 50%;
+  --chart-1: 182 100% 50%;
+  --chart-2: 286 100% 50%;
+  --chart-3: 157 100% 50%;
+  --chart-4: 54 100% 50%;
+  --chart-5: 0 100% 50%;
+
+  --shadow-2xs: 0px 2px 0px 0px hsl(202.8169 89.1213% 53.1373% / 0.00);
+  --shadow-xs: 0px 2px 0px 0px hsl(202.8169 89.1213% 53.1373% / 0.00);
+  --shadow-sm: 0px 2px 0px 0px hsl(202.8169 89.1213% 53.1373% / 0.00), 0px 1px 2px -1px hsl(202.8169 89.1213% 53.1373% / 0.00);
+  --shadow: 0px 2px 0px 0px hsl(202.8169 89.1213% 53.1373% / 0.00), 0px 1px 2px -1px hsl(202.8169 89.1213% 53.1373% / 0.00);
+  --shadow-md: 0px 2px 0px 0px hsl(202.8169 89.1213% 53.1373% / 0.00), 0px 2px 4px -1px hsl(202.8169 89.1213% 53.1373% / 0.00);
+  --shadow-lg: 0px 2px 0px 0px hsl(202.8169 89.1213% 53.1373% / 0.00), 0px 4px 6px -1px hsl(202.8169 89.1213% 53.1373% / 0.00);
+  --shadow-xl: 0px 2px 0px 0px hsl(202.8169 89.1213% 53.1373% / 0.00), 0px 8px 10px -1px hsl(202.8169 89.1213% 53.1373% / 0.00);
+  --shadow-2xl: 0px 2px 0px 0px hsl(202.8169 89.1213% 53.1373% / 0.00);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    background: #0a0a14 !important;
+  }
+
+  body {
+    @apply font-sans antialiased text-foreground;
+    background: #0a0a14 !important;
+    position: relative;
+    height: 100dvh;
+    overflow: hidden;
+  }
+
+  body::after {
+    content: "";
+    pointer-events: none;
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    background: repeating-linear-gradient(
+      180deg,
+      transparent,
+      transparent 2px,
+      rgba(0, 0, 0, 0.12) 2px,
+      rgba(0, 0, 0, 0.12) 4px
+    );
+  }
+
+  #root {
+    background: #0a0a14 !important;
+    height: 100dvh;
+    overflow: hidden;
+  }
+}
+
+@keyframes scanline-scroll {
+  0%   { transform: translateY(0); }
+  100% { transform: translateY(4px); }
+}
+
+@keyframes neon-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.7; }
+}
+
+/**
+ * Using the elevate system.
+ * Automatic contrast adjustment.
+ *
+ * <element className="hover-elevate" />
+ * <element className="active-elevate-2" />
+ *
+ * // Using the tailwind utility when a data attribute is "on"
+ * <element className="toggle-elevate data-[state=on]:toggle-elevated" />
+ * // Or manually controlling the toggle state
+ * <element className="toggle-elevate toggle-elevated" />
+ *
+ * Elevation systems have to handle many states.
+ * - not-hovered, vs. hovered vs. active  (three mutually exclusive states)
+ * - toggled or not
+ * - focused or not (this is not handled with these utilities)
+ *
+ * Even without handling focused or not, this is six possible combinations that
+ * need to be distinguished from eachother visually.
+ */
+@layer utilities {
+
+  /* Hide ugly search cancel button in Chrome until we can style it properly */
+  input[type="search"]::-webkit-search-cancel-button {
+    @apply hidden;
+  }
+
+  /* Placeholder styling for contentEditable div */
+  [contenteditable][data-placeholder]:empty::before {
+    content: attr(data-placeholder);
+    color: hsl(var(--muted-foreground));
+    pointer-events: none;
+  }
+
+  /* .no-default-hover-elevate/no-default-active-elevate is an escape hatch so consumers of
+   * buttons/badges can remove the automatic brightness adjustment on interactions
+   * and program their own. */
+  .no-default-hover-elevate {}
+
+  .no-default-active-elevate {}
+
+
+  /**
+   * Toggleable backgrounds go behind the content. Hoverable/active goes on top.
+   * This way they can stack/compound. Both will overlap the parent's borders!
+   * So borders will be automatically adjusted both on toggle, and hover/active,
+   * and they will be compounded.
+   */
+  .toggle-elevate::before,
+  .toggle-elevate-2::before {
+    content: "";
+    pointer-events: none;
+    position: absolute;
+    inset: 0px;
+    /*border-radius: inherit;   match rounded corners */
+    border-radius: inherit;
+    z-index: -1;
+    /* sits behind content but above backdrop */
+  }
+
+  .toggle-elevate.toggle-elevated::before {
+    background-color: var(--elevate-2);
+  }
+
+  /* If there's a 1px border, adjust the inset so that it covers that parent's border */
+  .border.toggle-elevate::before {
+    inset: -1px;
+  }
+
+  /* Does not work on elements with overflow:hidden! */
+  .hover-elevate:not(.no-default-hover-elevate),
+  .active-elevate:not(.no-default-active-elevate),
+  .hover-elevate-2:not(.no-default-hover-elevate),
+  .active-elevate-2:not(.no-default-active-elevate) {
+    position: relative;
+    z-index: 0;
+  }
+
+  .hover-elevate:not(.no-default-hover-elevate)::after,
+  .active-elevate:not(.no-default-active-elevate)::after,
+  .hover-elevate-2:not(.no-default-hover-elevate)::after,
+  .active-elevate-2:not(.no-default-active-elevate)::after {
+    content: "";
+    pointer-events: none;
+    position: absolute;
+    inset: 0px;
+    /*border-radius: inherit;   match rounded corners */
+    border-radius: inherit;
+    z-index: 999;
+    /* sits in front of content */
+  }
+
+  .hover-elevate:hover:not(.no-default-hover-elevate)::after,
+  .active-elevate:active:not(.no-default-active-elevate)::after {
+    background-color: var(--elevate-1);
+  }
+
+  .hover-elevate-2:hover:not(.no-default-hover-elevate)::after,
+  .active-elevate-2:active:not(.no-default-active-elevate)::after {
+    background-color: var(--elevate-2);
+  }
+
+  /* If there's a 1px border, adjust the inset so that it covers that parent's border */
+  .border.hover-elevate:not(.no-hover-interaction-elevate)::after,
+  .border.active-elevate:not(.no-active-interaction-elevate)::after,
+  .border.hover-elevate-2:not(.no-hover-interaction-elevate)::after,
+  .border.active-elevate-2:not(.no-active-interaction-elevate)::after,
+  .border.hover-elevate:not(.no-hover-interaction-elevate)::after {
+    inset: -1px;
+  }
+}
+
+html, body, #root {
+  height: 100dvh;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+================================================================
+FILE 3: artifacts/poker-bluff/src/App.tsx
+================================================================
+import { Switch, Route, Router as WouterRouter, useLocation } from "wouter";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { Toaster } from "@/components/ui/toaster";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import NotFound from "@/pages/not-found";
+import Home from "@/pages/Home";
+import Tournaments from "@/pages/Tournaments";
+import Leaderboard from "@/pages/Leaderboard";
+import Profile from "@/pages/Profile";
+import Shop from "@/pages/Shop";
+import Settings from "@/pages/Settings";
+import HoldemTable from "@/pages/HoldemTable";
+import Lobby from "@/pages/Lobby";
+import MultiTable from "@/pages/MultiTable";
+import { Layout } from "@/components/Layout";
+import { BottomNav } from "@/components/BottomNav";
+import { Header } from "@/components/Header";
+import { LangProvider } from "@/context/LangContext";
+import { TelegramProvider } from "@/context/TelegramContext";
+import { SoundProvider } from "@/context/SoundContext";
+
+const queryClient = new QueryClient();
+
+const FULLSCREEN_ROUTES = ["/holdem", "/lobby", "/multi"];
+
+function NavGuard() {
+  const [location] = useLocation();
+  if (FULLSCREEN_ROUTES.includes(location)) return null;
+  return <BottomNav />;
+}
+
+function HeaderGuard() {
+  const [location] = useLocation();
+  if (FULLSCREEN_ROUTES.includes(location)) return null;
+  return <Header />;
+}
+
+function Router() {
+  return (
+    <Layout>
+      <HeaderGuard />
+      <Switch>
+        <Route path="/" component={Home} />
+        <Route path="/tournaments" component={Tournaments} />
+        <Route path="/shop" component={Shop} />
+        <Route path="/leaderboard" component={Leaderboard} />
+        <Route path="/profile" component={Profile} />
+        <Route path="/settings" component={Settings} />
+        <Route path="/holdem" component={HoldemTable} />
+        <Route path="/lobby" component={Lobby} />
+        <Route path="/multi" component={MultiTable} />
+        <Route component={NotFound} />
+      </Switch>
+      <NavGuard />
+    </Layout>
+  );
+}
+
+function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <LangProvider>
+          <SoundProvider>
+          <TelegramProvider>
+            <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, "")}>
+              <Router />
+            </WouterRouter>
+            <Toaster />
+          </TelegramProvider>
+          </SoundProvider>
+        </LangProvider>
+      </TooltipProvider>
+    </QueryClientProvider>
+  );
+}
+
+export default App;
+
+
+================================================================
+FILE 4: artifacts/poker-bluff/src/components/Layout.tsx
+================================================================
+export function Layout({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      className="text-foreground"
+      style={{ background: "#0a0a14", height: "100dvh", width: "100%", position: "relative", overflow: "hidden" }}
+    >
+      <div
+        className="max-w-[480px] mx-auto relative"
+        style={{
+          background: "#0a0a14",
+          borderLeft: "1px solid #4dfff320",
+          borderRight: "1px solid #4dfff320",
+          height: "100dvh",
+          overflow: "hidden",
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
